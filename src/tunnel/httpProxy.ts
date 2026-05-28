@@ -22,6 +22,7 @@ import {
   type ResFrame,
   type ErrFrame,
 } from './protocol';
+import { renderTunnelNotFoundPage } from './tunnelNotFoundPage';
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -40,7 +41,7 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
 
   const tunnel = getTunnelBySubdomain(subdomain);
   if (!tunnel) {
-    res.status(404).type('text/plain').send('tunnel not found');
+    res.status(404).type('html').send(renderTunnelNotFoundPage());
     return;
   }
 
