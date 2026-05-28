@@ -22,6 +22,7 @@ import { healthRouter } from './routes/health';
 import { errorHandler } from './middleware/errorHandler';
 import { attachTunnelWs } from './tunnel/wsServer';
 import { tunnelProxy } from './tunnel/httpProxy';
+import { extractSubdomain } from './tunnel/host';
 
 function buildApp(): express.Express {
   const app = express();
@@ -30,7 +31,20 @@ function buildApp(): express.Express {
     app.set('trust proxy', 1);
   }
 
-  app.use(helmet());
+  // Helmet only on the relay's own routes (apex domain). For tunneled
+  // subdomain requests the response body is iClaw's — we're just a byte
+  // forwarder and have no business setting CSP/HSTS/COOP on content we
+  // never inspect. helmet's defaults (upgrade-insecure-requests,
+  // form-action 'self', HSTS) also break legitimate http-only local-dev
+  // tunnels (broken form submits, ERR_SSL_PROTOCOL_ERROR on /favicon.ico,
+  // etc.).
+  const helmetMiddleware = helmet();
+  app.use((req, res, next) => {
+    if (extractSubdomain(req.headers.host, config.baseDomain)) {
+      return next();
+    }
+    helmetMiddleware(req, res, next);
+  });
   app.use(compression());
 
   app.use(
