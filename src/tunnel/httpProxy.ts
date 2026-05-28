@@ -2,17 +2,17 @@
  * HTTP proxy middleware.
  *
  * For any request whose Host header matches `<subdomain>.<baseDomain>`,
- * locate the tunnel and forward the request as a `req` frame, then write
- * the `res` frame back as a normal HTTP response.
+ * locate the tunnel, forward the request as a `req` frame over the
+ * owning iClaw WS (a single WS may carry many tunnels), then write the
+ * `res` frame back as a normal HTTP response.
  *
- * Falls through (calls `next()`) when the Host header has no subdomain or
- * no matching tunnel exists — that lets normal routes (e.g. /healthz) keep
- * working on the apex domain in production.
+ * Falls through (`next()`) when the Host has no subdomain or no
+ * matching tunnel exists.
  */
 
 import type { RequestHandler } from 'express';
 import { config } from '../config';
-import { getTunnel } from './hub';
+import { getTunnelBySubdomain } from './hub';
 import { generateRequestId } from './idGen';
 import { extractSubdomain } from './host';
 import {
@@ -38,13 +38,13 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
   const subdomain = extractSubdomain(req.headers.host, config.baseDomain);
   if (!subdomain) return next();
 
-  const tunnel = getTunnel(subdomain);
+  const tunnel = getTunnelBySubdomain(subdomain);
   if (!tunnel) {
     res.status(404).type('text/plain').send('tunnel not found');
     return;
   }
 
-  // Forward request → frame → tunnel WS → await `res` frame.
+  // Forward request → frame → iClaw conn WS → await `res` frame.
   void (async () => {
     try {
       const body = await readRequestBody(req);
@@ -52,6 +52,7 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
 
       const reqFrame: ReqFrame = {
         t: 'req',
+        tunnelId: tunnel.tunnelId,
         id,
         method: req.method,
         path: req.originalUrl,
@@ -65,7 +66,7 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
           reject(new Error('tunnel timeout'));
         }, REQUEST_TIMEOUT_MS);
         tunnel.pending.set(id, { resolve, reject, timer });
-        tunnel.ws.send(JSON.stringify(reqFrame));
+        tunnel.conn.ws.send(JSON.stringify(reqFrame));
       });
 
       const frame = parseFrame(responseRaw);

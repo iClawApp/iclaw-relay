@@ -1,18 +1,12 @@
 /**
  * Bridge a public-facing WebSocket onto an existing tunnel.
  *
- * Lifecycle:
- *   - public client upgrades on `<sub>.<baseDomain>/<path>` → relay
- *   - relay completes the WS handshake itself (no subprotocol negotiation)
- *   - relay sends a `ws-open` frame down the tunnel with the path + headers
- *   - subsequent messages either way are wrapped in `ws-data` frames
- *   - close either side → `ws-close` frame + drop from the tunnel's
- *     `streams` map
- *
- * We intentionally do NOT replay the full TCP-level upgrade through the
- * tunnel. That would let us preserve subprotocol negotiation perfectly,
- * but iClaw's local /ws server doesn't use subprotocols, so the simpler
- * "two independent WS connections bridged by JSON frames" model is fine.
+ * One WS upgrade arriving at `<sub>.<baseDomain>/<path>` → relay
+ * completes the handshake → relay sends a `ws-open` frame down the
+ * tunnel's *iClaw* WS (the shared one for the whole iClaw process)
+ * carrying both the `tunnelId` and a fresh stream id. Further data
+ * goes back and forth as `ws-data`. Either side closing emits
+ * `ws-close`.
  */
 
 import type { IncomingMessage } from 'node:http';
@@ -32,7 +26,6 @@ import { config } from '../config';
 const publicWss = new WebSocketServer({
   noServer: true,
   maxPayload: 16 * 1024 * 1024,
-  // Explicitly refuse subprotocols — see file comment.
   handleProtocols: () => false,
 });
 
@@ -61,12 +54,13 @@ export function bridgePublicUpgrade(
 
     const openFrame: WsOpenFrame = {
       t: 'ws-open',
+      tunnelId: tunnel.tunnelId,
       id: streamId,
       path: req.url ?? '/',
       headers: stripHopByHopHeaders(req.headers),
     };
 
-    if (tunnel.ws.readyState !== WebSocket.OPEN) {
+    if (tunnel.conn.ws.readyState !== WebSocket.OPEN) {
       tunnel.streams.delete(streamId);
       try {
         publicWs.close(1011, 'tunnel gone');
@@ -75,7 +69,7 @@ export function bridgePublicUpgrade(
       }
       return;
     }
-    safeSend(tunnel.ws, JSON.stringify(openFrame));
+    safeSend(tunnel.conn.ws, JSON.stringify(openFrame));
 
     publicWs.on('message', (data, isBinary) => {
       const buf = Buffer.isBuffer(data)
@@ -85,25 +79,24 @@ export function bridgePublicUpgrade(
         : Buffer.from(data as ArrayBuffer);
       const f: WsDataFrame = {
         t: 'ws-data',
+        tunnelId: tunnel.tunnelId,
         id: streamId,
         binary: !!isBinary,
         data: buf.toString('base64'),
       };
-      safeSend(tunnel.ws, JSON.stringify(f));
+      safeSend(tunnel.conn.ws, JSON.stringify(f));
     });
 
     publicWs.on('close', (code, reason) => {
-      if (!tunnel.streams.delete(streamId)) {
-        // Already removed (probably triggered by inbound ws-close) — don't double-notify.
-        return;
-      }
+      if (!tunnel.streams.delete(streamId)) return;
       const f: WsCloseFrame = {
         t: 'ws-close',
+        tunnelId: tunnel.tunnelId,
         id: streamId,
         code,
         reason: reason && reason.length ? reason.toString('utf8') : undefined,
       };
-      safeSend(tunnel.ws, JSON.stringify(f));
+      safeSend(tunnel.conn.ws, JSON.stringify(f));
       if (config.logAccess) {
         console.log(`[tunnel] ws-close subdomain=${tunnel.subdomain} stream=${streamId} code=${code}`);
       }
@@ -130,7 +123,6 @@ export function deliverWsData(tunnel: Tunnel, frame: WsDataFrame): void {
 export function deliverWsClose(tunnel: Tunnel, frame: WsCloseFrame): void {
   const ws = tunnel.streams.get(frame.id);
   if (!ws) return;
-  // Remove first so the public 'close' handler doesn't echo a frame back.
   tunnel.streams.delete(frame.id);
   try {
     ws.close(frame.code, frame.reason);

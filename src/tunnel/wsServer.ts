@@ -1,44 +1,53 @@
 /**
- * WebSocket upgrade router.
+ * WebSocket upgrade router + multiplexed tunnel server.
  *
- * Two kinds of upgrades land on this server:
+ * Two kinds of upgrades land here:
  *
- *   1. POST-style outbound from a local iClaw:  ws://relay/tunnel
- *      → register a new tunnel, allocate subdomain, send `hello`.
+ *   1. `ws://relay/tunnel`  — outbound from a local iClaw process. We
+ *      accept it as a single long-lived IclawConnection and demultiplex
+ *      multiple logical tunnels over it (register-tunnel / unregister-
+ *      tunnel + req/res/ws-* frames each carrying `tunnelId`).
  *
- *   2. Public client opening a WS on a tunnel subdomain:
- *      ws(s)://<sub>.<baseDomain>/<anything>
- *      → bridge it onto the existing tunnel as a `ws-open` stream.
+ *   2. `ws(s)://<sub>.<baseDomain>/<anything>` — public client opening
+ *      a WS that should reach iClaw's local /ws (or other path). We
+ *      look up the tunnel by subdomain and bridge it through the
+ *      owning iClaw connection's WS as a `ws-open` stream.
  *
- * Both flows share the same Node http.Server `upgrade` event; we discriminate
- * by the path AND the Host header.
- *
- * Auth / invite-token validation is NOT yet wired here for the tunnel
- * registration path. The password gate on the iClaw side guards the public
- * stream (we forward the upgrade headers including Cookie, iClaw verifies
- * the session before opening the loopback WS).
+ * Rate-limiting moved from "per WS upgrade" to "per register-tunnel
+ * message". A single iClaw connection is cheap (it just sits there);
+ * what we want to throttle is the *creation of new tunnels*.
  */
 
 import type { Server as HttpServer, IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
-import { WebSocketServer, type WebSocket } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 
 import { config } from '../config';
-import { addTunnel, getTunnel, removeTunnel, type Tunnel } from './hub';
+import {
+  newConnection,
+  addTunnel,
+  getTunnelBySubdomain,
+  getTunnelByTunnelId,
+  removeTunnelBySubdomain,
+  removeAllTunnelsForConn,
+  type IclawConnection,
+  type Tunnel,
+} from './hub';
 import { generateSubdomain } from './idGen';
 import { extractSubdomain } from './host';
-import { parseFrame, type HelloFrame } from './protocol';
+import {
+  parseFrame,
+  type Frame,
+  type RegisterTunnelFrame,
+  type TunnelRegisteredFrame,
+  type TunnelRejectedFrame,
+  type UnregisterTunnelFrame,
+} from './protocol';
 import { bridgePublicUpgrade, deliverWsData, deliverWsClose } from './publicWs';
 import { checkAndCountTunnelRegistration } from './rateLimit';
 
 const TUNNEL_PATH = '/tunnel';
 
-/**
- * Extract the originating client IP for rate-limit bookkeeping. Honours
- * X-Forwarded-For only when the operator opted in via TRUST_PROXY — we
- * MUST NOT trust XFF on a directly-exposed relay or anyone can spoof
- * their IP and burst past the limits.
- */
 function getClientIp(req: IncomingMessage): string {
   if (config.trustProxy) {
     const xff = req.headers['x-forwarded-for'];
@@ -51,13 +60,6 @@ function getClientIp(req: IncomingMessage): string {
   return req.socket.remoteAddress ?? 'unknown';
 }
 
-/**
- * Whether an IP is a loopback / same-host address. Loopback connections
- * are by definition coming from the machine the relay runs on — it owns
- * the relay anyway, there's no abuse vector to defend against, and
- * applying a per-IP cap there only ever breaks legitimate dev
- * (multiple tunnels + reconnects all share 127.0.0.1).
- */
 function isLoopbackIp(ip: string): boolean {
   return (
     ip === '127.0.0.1' ||
@@ -68,48 +70,32 @@ function isLoopbackIp(ip: string): boolean {
   );
 }
 
+function safeSend(ws: WebSocket, payload: string): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(payload);
+  } catch {
+    // ignore
+  }
+}
+
 export function attachTunnelWs(server: HttpServer): void {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
 
-    // (1) Outbound iClaw client registering a new tunnel.
+    // (1) Outbound iClaw client opening its shared WS.
     if (url.pathname === TUNNEL_PATH) {
       const ip = getClientIp(req);
-
-      // Loopback never rate-limited (see isLoopbackIp comment).
-      if (!isLoopbackIp(ip)) {
-        const limit = checkAndCountTunnelRegistration(ip, {
-          perHour: config.limits.tunnelPerIpPerHour,
-          perDay: config.limits.tunnelPerIpPerDay,
-        });
-        if (!limit.ok) {
-          // RFC 6585 §4. Counted before the upgrade so abusers don't
-          // get a tunnel allocated, hub entry created, etc.
-          const retryAfter = limit.retryAfterSec ?? 3600;
-          console.warn(
-            `[tunnel] rate-limited ip=${ip} reason=${limit.reason} retry-after=${retryAfter}s`,
-          );
-          socket.write(
-            `HTTP/1.1 429 Too Many Requests\r\n` +
-            `Retry-After: ${retryAfter}\r\n` +
-            `Connection: close\r\n` +
-            `Content-Length: 0\r\n\r\n`,
-          );
-          socket.destroy();
-          return;
-        }
-      }
-
-      wss.handleUpgrade(req, socket, head, (ws) => handleTunnel(ws));
+      wss.handleUpgrade(req, socket, head, (ws) => handleIclawConnection(ws, ip));
       return;
     }
 
     // (2) Public client connecting to <sub>.<baseDomain>/*.
     const sub = extractSubdomain(req.headers.host, config.baseDomain);
     if (sub) {
-      const tunnel = getTunnel(sub);
+      const tunnel = getTunnelBySubdomain(sub);
       if (!tunnel) {
         socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
         socket.destroy();
@@ -119,16 +105,124 @@ export function attachTunnelWs(server: HttpServer): void {
       return;
     }
 
-    // Neither — refuse.
     socket.destroy();
   });
 }
 
-function handleTunnel(ws: WebSocket): void {
+function handleIclawConnection(ws: WebSocket, ip: string): void {
+  const conn = newConnection(ws, ip);
+  if (config.logAccess) {
+    console.log(`[tunnel] conn open ip=${ip}`);
+  }
+
+  ws.on('message', (data) => {
+    const raw = typeof data === 'string' ? data : data.toString('utf8');
+    const frame = parseFrame(raw);
+    if (!frame) return;
+    routeFromIclaw(conn, frame, raw);
+  });
+
+  const cleanup = (): void => {
+    removeAllTunnelsForConn(conn);
+    if (config.logAccess) {
+      console.log(`[tunnel] conn close ip=${ip}`);
+    }
+  };
+  ws.on('close', cleanup);
+  ws.on('error', (err) => {
+    console.warn(`[tunnel] conn error ip=${ip} :: ${err.message}`);
+    cleanup();
+  });
+}
+
+function routeFromIclaw(conn: IclawConnection, frame: Frame, raw: string): void {
+  switch (frame.t) {
+    case 'register-tunnel':
+      handleRegister(conn, frame);
+      return;
+
+    case 'unregister-tunnel':
+      handleUnregister(conn, frame);
+      return;
+
+    case 'res':
+    case 'err': {
+      // Response to an HTTP request we forwarded. Find the matching
+      // tunnel by the tunnelId on the frame, then resolve its pending.
+      const tunnel = getTunnelByTunnelId(conn, frame.tunnelId);
+      if (!tunnel) return;
+      const reqId = frame.t === 'res' ? frame.id : frame.id;
+      if (!reqId) return;
+      const pending = tunnel.pending.get(reqId);
+      if (!pending) return;
+      tunnel.pending.delete(reqId);
+      clearTimeout(pending.timer);
+      pending.resolve(raw);
+      return;
+    }
+
+    case 'ws-data': {
+      const tunnel = getTunnelByTunnelId(conn, frame.tunnelId);
+      if (!tunnel) return;
+      deliverWsData(tunnel, frame);
+      return;
+    }
+    case 'ws-close': {
+      const tunnel = getTunnelByTunnelId(conn, frame.tunnelId);
+      if (!tunnel) return;
+      deliverWsClose(tunnel, frame);
+      return;
+    }
+
+    case 'ping':
+      safeSend(conn.ws, JSON.stringify({ t: 'pong' }));
+      return;
+
+    // Frames the iClaw shouldn't send; ignore silently.
+    case 'pong':
+    case 'tunnel-registered':
+    case 'tunnel-rejected':
+    case 'ws-open':
+    case 'req':
+      return;
+  }
+}
+
+function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void {
+  const tunnelId = frame.tunnelId;
+  if (typeof tunnelId !== 'string' || tunnelId.length === 0) {
+    sendRejected(conn, tunnelId ?? '', 'invalid tunnelId');
+    return;
+  }
+
+  // If this tunnelId is already registered on this connection, treat as
+  // idempotent — return the existing subdomain.
+  const existing = getTunnelByTunnelId(conn, tunnelId);
+  if (existing) {
+    sendRegistered(conn, existing);
+    return;
+  }
+
+  // Per-IP rate limit (loopback exempt).
+  if (!isLoopbackIp(conn.ip)) {
+    const limit = checkAndCountTunnelRegistration(conn.ip, {
+      perHour: config.limits.tunnelPerIpPerHour,
+      perDay: config.limits.tunnelPerIpPerDay,
+    });
+    if (!limit.ok) {
+      console.warn(
+        `[tunnel] rate-limited ip=${conn.ip} reason=${limit.reason} retry-after=${limit.retryAfterSec}s`,
+      );
+      sendRejected(conn, tunnelId, 'rate-limited', limit.retryAfterSec);
+      return;
+    }
+  }
+
   const subdomain = generateSubdomain();
   const tunnel: Tunnel = {
     subdomain,
-    ws,
+    tunnelId,
+    conn,
     createdAt: Date.now(),
     pending: new Map(),
     streams: new Map(),
@@ -136,61 +230,38 @@ function handleTunnel(ws: WebSocket): void {
   addTunnel(tunnel);
 
   if (config.logAccess) {
-    console.log(`[tunnel] open subdomain=${subdomain}`);
+    console.log(`[tunnel] register tunnelId=${tunnelId} subdomain=${subdomain} ip=${conn.ip}`);
   }
+  sendRegistered(conn, tunnel);
+}
 
-  const hello: HelloFrame = {
-    t: 'hello',
-    subdomain,
+function handleUnregister(conn: IclawConnection, frame: UnregisterTunnelFrame): void {
+  const tunnel = getTunnelByTunnelId(conn, frame.tunnelId);
+  if (!tunnel) return;
+  removeTunnelBySubdomain(tunnel.subdomain);
+  if (config.logAccess) {
+    console.log(`[tunnel] unregister tunnelId=${frame.tunnelId} subdomain=${tunnel.subdomain}`);
+  }
+}
+
+function sendRegistered(conn: IclawConnection, t: Tunnel): void {
+  const f: TunnelRegisteredFrame = {
+    t: 'tunnel-registered',
+    tunnelId: t.tunnelId,
+    subdomain: t.subdomain,
     baseDomain: config.baseDomain,
-    publicUrl: config.publicUrlFor(subdomain),
+    publicUrl: config.publicUrlFor(t.subdomain),
   };
-  ws.send(JSON.stringify(hello));
+  safeSend(conn.ws, JSON.stringify(f));
+}
 
-  ws.on('message', (data) => {
-    const raw = typeof data === 'string' ? data : data.toString('utf8');
-    const frame = parseFrame(raw);
-    if (!frame) return;
-
-    // HTTP request/response correlation.
-    if (frame.t === 'res' || frame.t === 'err') {
-      const id = frame.id;
-      if (!id) return;
-      const pending = tunnel.pending.get(id);
-      if (!pending) return;
-      tunnel.pending.delete(id);
-      clearTimeout(pending.timer);
-      pending.resolve(raw);
-      return;
-    }
-
-    // WS-stream correlation.
-    if (frame.t === 'ws-data') {
-      deliverWsData(tunnel, frame);
-      return;
-    }
-    if (frame.t === 'ws-close') {
-      deliverWsClose(tunnel, frame);
-      return;
-    }
-
-    if (frame.t === 'ping') {
-      ws.send(JSON.stringify({ t: 'pong' }));
-      return;
-    }
-    // Unknown frames are ignored — be lenient with peers running newer protocol versions.
-  });
-
-  const cleanup = (): void => {
-    removeTunnel(subdomain);
-    if (config.logAccess) {
-      console.log(`[tunnel] close subdomain=${subdomain}`);
-    }
-  };
-
-  ws.on('close', cleanup);
-  ws.on('error', (err) => {
-    console.warn(`[tunnel] ws error subdomain=${subdomain} :: ${err.message}`);
-    cleanup();
-  });
+function sendRejected(
+  conn: IclawConnection,
+  tunnelId: string,
+  reason: string,
+  retryAfterSec?: number,
+): void {
+  const f: TunnelRejectedFrame = { t: 'tunnel-rejected', tunnelId, reason };
+  if (retryAfterSec !== undefined) f.retryAfterSec = retryAfterSec;
+  safeSend(conn.ws, JSON.stringify(f));
 }
