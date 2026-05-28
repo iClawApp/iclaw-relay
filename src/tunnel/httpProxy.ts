@@ -23,6 +23,7 @@ import {
   type ErrFrame,
 } from './protocol';
 import { renderTunnelNotFoundPage } from './tunnelNotFoundPage';
+import { renderReconnectingPage } from './reconnectingPage';
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -42,6 +43,13 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
   const tunnel = getTunnelBySubdomain(subdomain);
   if (!tunnel) {
     res.status(404).type('html').send(renderTunnelNotFoundPage());
+    return;
+  }
+  // Sticky subdomain — iClaw lost its WS but its tunnel is reserved.
+  // Tell the browser to retry shortly; the URL is still valid.
+  if (tunnel.reconnecting || !tunnel.conn || tunnel.conn.ws.readyState !== 1) {
+    res.status(503).setHeader('Retry-After', '5');
+    res.type('html').send(renderReconnectingPage());
     return;
   }
 
@@ -67,6 +75,12 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
           reject(new Error('tunnel timeout'));
         }, REQUEST_TIMEOUT_MS);
         tunnel.pending.set(id, { resolve, reject, timer });
+        if (!tunnel.conn || tunnel.conn.ws.readyState !== 1) {
+          clearTimeout(timer);
+          tunnel.pending.delete(id);
+          reject(new Error('tunnel reconnecting'));
+          return;
+        }
         tunnel.conn.ws.send(JSON.stringify(reqFrame));
       });
 

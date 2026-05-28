@@ -9,11 +9,10 @@
  * relay reconnects.
  *
  * The relay assigns a subdomain in response to `register-tunnel` and
- * tells iClaw about it via `tunnel-registered`. Subdomains are
- * intentionally **not** stable across reconnects in v1 — when an iClaw
- * WS closes and the same `tunnelId` is registered again later, the
- * relay treats it as a fresh registration and mints a new subdomain.
- * Sticky subdomains are a follow-up.
+ * tells iClaw about it via `tunnel-registered`. The same `tunnelId`
+ * re-registered within the reconnect grace window keeps the original
+ * subdomain; after the window, or on first register, a new subdomain
+ * is minted.
  *
  * All bodies are base64-encoded; v1 is non-streaming.
  */

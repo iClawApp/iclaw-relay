@@ -44,6 +44,21 @@ export function bridgePublicUpgrade(
   socket: Duplex,
   head: Buffer,
 ): void {
+  // Tunnel exists but its iClaw is in the reconnecting grace window — we
+  // can't forward this WS upgrade. Refuse at the HTTP layer so the
+  // browser sees a clean 503 rather than a black-hole socket.
+  if (tunnel.reconnecting || !tunnel.conn || tunnel.conn.ws.readyState !== WebSocket.OPEN) {
+    socket.write(
+      'HTTP/1.1 503 Service Unavailable\r\n' +
+      'Retry-After: 5\r\n' +
+      'Connection: close\r\n' +
+      'Content-Length: 0\r\n\r\n',
+    );
+    socket.destroy();
+    return;
+  }
+  const iclawWs = tunnel.conn.ws;
+
   publicWss.handleUpgrade(req, socket, head, (publicWs) => {
     const streamId = generateStreamId();
     tunnel.streams.set(streamId, publicWs);
@@ -60,7 +75,7 @@ export function bridgePublicUpgrade(
       headers: stripHopByHopHeaders(req.headers),
     };
 
-    if (tunnel.conn.ws.readyState !== WebSocket.OPEN) {
+    if (iclawWs.readyState !== WebSocket.OPEN) {
       tunnel.streams.delete(streamId);
       try {
         publicWs.close(1011, 'tunnel gone');
@@ -69,7 +84,7 @@ export function bridgePublicUpgrade(
       }
       return;
     }
-    safeSend(tunnel.conn.ws, JSON.stringify(openFrame));
+    safeSend(iclawWs, JSON.stringify(openFrame));
 
     publicWs.on('message', (data, isBinary) => {
       const buf = Buffer.isBuffer(data)
@@ -84,7 +99,8 @@ export function bridgePublicUpgrade(
         binary: !!isBinary,
         data: buf.toString('base64'),
       };
-      safeSend(tunnel.conn.ws, JSON.stringify(f));
+      // tunnel.conn may have flipped to null during reconnect — guard.
+      if (tunnel.conn) safeSend(tunnel.conn.ws, JSON.stringify(f));
     });
 
     publicWs.on('close', (code, reason) => {
@@ -96,7 +112,7 @@ export function bridgePublicUpgrade(
         code,
         reason: reason && reason.length ? reason.toString('utf8') : undefined,
       };
-      safeSend(tunnel.conn.ws, JSON.stringify(f));
+      if (tunnel.conn) safeSend(tunnel.conn.ws, JSON.stringify(f));
       if (config.logAccess) {
         console.log(`[tunnel] ws-close subdomain=${tunnel.subdomain} stream=${streamId} code=${code}`);
       }

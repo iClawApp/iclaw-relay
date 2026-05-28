@@ -28,8 +28,10 @@ import {
   addTunnel,
   getTunnelBySubdomain,
   getTunnelByTunnelId,
+  getTunnelByTunnelIdGlobal,
   removeTunnelBySubdomain,
-  removeAllTunnelsForConn,
+  detachConnAndKeepReserved,
+  tryRestoreTunnel,
   type IclawConnection,
   type Tunnel,
 } from './hub';
@@ -45,6 +47,9 @@ import {
 } from './protocol';
 import { bridgePublicUpgrade, deliverWsData, deliverWsClose } from './publicWs';
 import { checkAndCountTunnelRegistration } from './rateLimit';
+
+/** Interval between WS-protocol-level keep-alive pings on each iClaw conn. */
+const KEEP_ALIVE_MS = 30_000;
 
 const TUNNEL_PATH = '/tunnel';
 
@@ -115,6 +120,27 @@ function handleIclawConnection(ws: WebSocket, ip: string): void {
     console.log(`[tunnel] conn open ip=${ip}`);
   }
 
+  // ── WS-protocol keep-alive ──────────────────────────────────────
+  // Cloudflare (and other proxies in front of us) close idle
+  // WebSocket connections after ~100s. Without this we'd reconnect
+  // every couple of minutes for no reason. The `ws` library auto-
+  // responds to PING with PONG, so we just need to send pings.
+  // Also detects half-open peers: no pong before next interval →
+  // terminate, the iClaw side will reconnect.
+  conn.isAlive = true;
+  ws.on('pong', () => {
+    conn.isAlive = true;
+  });
+  conn.pingTimer = setInterval(() => {
+    if (!conn.isAlive) {
+      try { ws.terminate(); } catch { /* ignore */ }
+      return;
+    }
+    conn.isAlive = false;
+    try { ws.ping(); } catch { /* ignore */ }
+  }, KEEP_ALIVE_MS);
+  conn.pingTimer.unref();
+
   ws.on('message', (data) => {
     const raw = typeof data === 'string' ? data : data.toString('utf8');
     const frame = parseFrame(raw);
@@ -123,7 +149,13 @@ function handleIclawConnection(ws: WebSocket, ip: string): void {
   });
 
   const cleanup = (): void => {
-    removeAllTunnelsForConn(conn);
+    if (conn.pingTimer) {
+      clearInterval(conn.pingTimer);
+      conn.pingTimer = null;
+    }
+    // Sticky subdomains: keep tunnelId → subdomain reservations alive for
+    // the grace window so iClaw's reconnect lands on the same URL.
+    detachConnAndKeepReserved(conn);
     if (config.logAccess) {
       console.log(`[tunnel] conn close ip=${ip}`);
     }
@@ -195,15 +227,28 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     return;
   }
 
-  // If this tunnelId is already registered on this connection, treat as
-  // idempotent — return the existing subdomain.
+  // (1) Already active on this connection? Idempotent — same subdomain.
   const existing = getTunnelByTunnelId(conn, tunnelId);
   if (existing) {
     sendRegistered(conn, existing);
     return;
   }
 
-  // Per-IP rate limit (loopback exempt).
+  // (2) Sticky subdomain: tunnel currently in the reconnecting grace
+  // window with the same tunnelId? Attach it to this new connection so
+  // the URL is preserved. Doesn't count against the rate limit.
+  const restored = tryRestoreTunnel(tunnelId, conn);
+  if (restored) {
+    if (config.logAccess) {
+      console.log(
+        `[tunnel] restore tunnelId=${tunnelId} subdomain=${restored.subdomain} ip=${conn.ip}`,
+      );
+    }
+    sendRegistered(conn, restored);
+    return;
+  }
+
+  // (3) Fresh registration. Rate-limited (loopback exempt).
   if (!isLoopbackIp(conn.ip)) {
     const limit = checkAndCountTunnelRegistration(conn.ip, {
       perHour: config.limits.tunnelPerIpPerHour,
@@ -226,6 +271,8 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     createdAt: Date.now(),
     pending: new Map(),
     streams: new Map(),
+    reconnecting: false,
+    evictTimer: null,
   };
   addTunnel(tunnel);
 
@@ -236,7 +283,12 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
 }
 
 function handleUnregister(conn: IclawConnection, frame: UnregisterTunnelFrame): void {
-  const tunnel = getTunnelByTunnelId(conn, frame.tunnelId);
+  // Prefer the conn-scoped lookup; fall back to global so an iClaw can
+  // explicitly retire a reconnecting tunnel before the grace window
+  // expires (e.g. user clicks Disable on the new connection).
+  const tunnel =
+    getTunnelByTunnelId(conn, frame.tunnelId) ??
+    getTunnelByTunnelIdGlobal(frame.tunnelId);
   if (!tunnel) return;
   removeTunnelBySubdomain(tunnel.subdomain);
   if (config.logAccess) {
