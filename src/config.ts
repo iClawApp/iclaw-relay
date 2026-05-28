@@ -32,8 +32,37 @@ const RawConfigSchema = z.object({
   /**
    * Base domain under which per-tunnel subdomains are minted, e.g.
    * a tunnel "silver-fox" → https://silver-fox.iclaw.digital
+   *
+   * For local browser testing, set this to `lvh.me` (or `<ip>.nip.io`) —
+   * those wildcards resolve to 127.0.0.1 automatically, so the URL we
+   * print is openable directly in the browser without /etc/hosts.
    */
   BASE_DOMAIN: z.string().min(1).default('iclaw.digital'),
+
+  /**
+   * Scheme used when constructing the public tunnel URL we report back to
+   * the iClaw client. In production this is `https` (the relay sits
+   * behind a TLS terminator); in local dev set to `http` so the printed
+   * URL is openable in a browser without TLS.
+   */
+  PUBLIC_SCHEME: z.enum(['http', 'https']).default('https'),
+
+  /**
+   * Port to include in the public tunnel URL. Leave empty in production
+   * (so the URL uses the default 80/443). In local dev set to the same
+   * value as PORT (e.g. 4100) so browsers can reach the relay directly.
+   */
+  PUBLIC_PORT: z
+    .string()
+    .optional()
+    .transform((v) => {
+      if (v === undefined || v === '') return undefined;
+      const n = Number(v);
+      if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+        throw new Error(`PUBLIC_PORT must be 1..65535, got ${v}`);
+      }
+      return n;
+    }),
 
   /**
    * Comma-separated list of origins allowed for the public HTTP API.
@@ -95,6 +124,17 @@ function parseAllowedOrigins(input: string): readonly string[] | '*' {
   );
 }
 
+function buildPublicUrl(subdomain: string): string {
+  const scheme = raw.PUBLIC_SCHEME;
+  const port = raw.PUBLIC_PORT;
+  const base = raw.BASE_DOMAIN.replace(/\/+$/, '');
+  // Omit the port suffix when it matches the scheme's default.
+  const isDefaultPort =
+    (scheme === 'http' && port === 80) || (scheme === 'https' && port === 443);
+  const portSuffix = port === undefined || isDefaultPort ? '' : `:${port}`;
+  return `${scheme}://${subdomain}.${base}${portSuffix}`;
+}
+
 /** Strongly-typed config object exported to the rest of the app. */
 export const config = Object.freeze({
   env: raw.NODE_ENV,
@@ -103,6 +143,11 @@ export const config = Object.freeze({
   port: raw.PORT,
   host: raw.HOST,
   baseDomain: raw.BASE_DOMAIN.replace(/\/+$/, ''),
+  publicScheme: raw.PUBLIC_SCHEME,
+  publicPort: raw.PUBLIC_PORT,
+
+  /** Build the user-facing URL for a tunnel subdomain. */
+  publicUrlFor: buildPublicUrl,
 
   cors: Object.freeze({
     allowedOrigins: parseAllowedOrigins(raw.ALLOWED_ORIGINS),

@@ -81,7 +81,7 @@ function handleTunnel(ws: WebSocket): void {
     t: 'hello',
     subdomain,
     baseDomain: config.baseDomain,
-    publicUrl: `https://${subdomain}.${config.baseDomain}`,
+    publicUrl: config.publicUrlFor(subdomain),
   };
   ws.send(JSON.stringify(hello));
 
