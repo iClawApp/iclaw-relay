@@ -31,35 +31,40 @@ function buildApp(): express.Express {
     app.set('trust proxy', 1);
   }
 
-  // Helmet only on the relay's own routes (apex domain). For tunneled
-  // subdomain requests the response body is iClaw's — we're just a byte
-  // forwarder and have no business setting CSP/HSTS/COOP on content we
-  // never inspect. helmet's defaults (upgrade-insecure-requests,
-  // form-action 'self', HSTS) also break legitimate http-only local-dev
-  // tunnels (broken form submits, ERR_SSL_PROTOCOL_ERROR on /favicon.ico,
-  // etc.).
-  const helmetMiddleware = helmet();
-  app.use((req, res, next) => {
-    if (extractSubdomain(req.headers.host, config.baseDomain)) {
-      return next();
-    }
-    helmetMiddleware(req, res, next);
-  });
-  app.use(compression());
+  // Apex-only middleware. The relay is a byte forwarder for tunneled
+  // subdomain requests; setting CSP/HSTS/COOP, enforcing a CORS allow-list
+  // against the tunnel subdomain, or re-compressing iClaw's response are
+  // all the wrong layer to operate on content we never inspect.
+  //
+  // Net result: requests to `<sub>.<baseDomain>` skip helmet/cors/
+  // compression entirely and fall through to `tunnelProxy`. Requests to
+  // the apex (e.g. `/healthz`) keep full protection.
+  function apexOnly(mw: express.RequestHandler): express.RequestHandler {
+    return (req, res, next) => {
+      if (extractSubdomain(req.headers.host, config.baseDomain)) {
+        return next();
+      }
+      return mw(req, res, next);
+    };
+  }
 
+  app.use(apexOnly(helmet()));
+  app.use(apexOnly(compression()));
   app.use(
-    cors({
-      origin: (origin, cb) => {
-        const allow = config.cors.allowedOrigins;
-        if (allow === '*') return cb(null, true);
-        if (!origin) return cb(null, true);
-        if (allow.includes(origin)) return cb(null, true);
-        cb(new Error(`Origin ${origin} is not allowed by CORS`));
-      },
-      methods: ['GET', 'POST', 'OPTIONS'],
-      allowedHeaders: ['Content-Type'],
-      maxAge: 600,
-    }),
+    apexOnly(
+      cors({
+        origin: (origin, cb) => {
+          const allow = config.cors.allowedOrigins;
+          if (allow === '*') return cb(null, true);
+          if (!origin) return cb(null, true);
+          if (allow.includes(origin)) return cb(null, true);
+          cb(new Error(`Origin ${origin} is not allowed by CORS`));
+        },
+        methods: ['GET', 'POST', 'OPTIONS'],
+        allowedHeaders: ['Content-Type'],
+        maxAge: 600,
+      }),
+    ),
   );
 
   app.use(healthRouter);
