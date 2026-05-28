@@ -42,7 +42,12 @@ export function generateSubdomain(): string {
   return `${randomElement(ADJECTIVES)}-${randomElement(NOUNS)}-${randomSuffix(4)}`;
 }
 
-/** Short hex id for request correlation. Never exposed externally. */
+/** Short hex id for HTTP request correlation. Never exposed externally. */
 export function generateRequestId(): string {
   return `r-${randomBytes(6).toString('hex')}`;
+}
+
+/** Short hex id for a public WS stream. Distinct namespace from request ids. */
+export function generateStreamId(): string {
+  return `s-${randomBytes(6).toString('hex')}`;
 }

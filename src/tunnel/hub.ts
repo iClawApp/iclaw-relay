@@ -18,8 +18,10 @@ export interface Tunnel {
   subdomain: string;
   ws: WebSocket;
   createdAt: number;
-  /** Open requests waiting for their matching `res` frame. */
+  /** Open HTTP requests waiting for their matching `res` frame. */
   pending: Map<string, PendingRequest>;
+  /** Open public-side WebSocket streams, keyed by stream id. */
+  streams: Map<string, WebSocket>;
 }
 
 const tunnels = new Map<string, Tunnel>();
@@ -36,6 +38,14 @@ export function removeTunnel(subdomain: string): void {
     p.reject(new Error('tunnel closed'));
   }
   t.pending.clear();
+  for (const ws of t.streams.values()) {
+    try {
+      ws.close(1011, 'tunnel closed');
+    } catch {
+      // ignore
+    }
+  }
+  t.streams.clear();
   tunnels.delete(subdomain);
 }
 

@@ -58,6 +58,42 @@ export interface ErrFrame {
   message: string;
 }
 
+/**
+ * WebSocket-stream frames. Each public WS upgrade arriving on a subdomain
+ * gets its own stream id (separate namespace from HTTP request ids — we
+ * use the `s-` prefix vs `r-`). The relay completes the WebSocket
+ * handshake on the public side and forwards application-level WS messages
+ * verbatim through the tunnel; the local iClaw opens a matching loopback
+ * WS to its own `/ws` endpoint and pipes the bytes both ways.
+ *
+ * Subprotocol negotiation is intentionally not supported in v0 — iClaw's
+ * `/ws` doesn't advertise subprotocols.
+ */
+export interface WsOpenFrame {
+  t: 'ws-open';
+  /** Stream id (s-XXXX). Echoed back on every ws-data/ws-close for this stream. */
+  id: string;
+  /** Original path + query string from the public upgrade request. */
+  path: string;
+  /** Lower-cased header names → value. Hop-by-hop + internal headers already stripped. */
+  headers: Record<string, string>;
+}
+
+export interface WsDataFrame {
+  t: 'ws-data';
+  id: string;
+  binary: boolean;
+  /** Base64-encoded WebSocket message payload. */
+  data: string;
+}
+
+export interface WsCloseFrame {
+  t: 'ws-close';
+  id: string;
+  code?: number;
+  reason?: string;
+}
+
 export interface PingFrame {
   t: 'ping';
 }
@@ -71,6 +107,9 @@ export type Frame =
   | ReqFrame
   | ResFrame
   | ErrFrame
+  | WsOpenFrame
+  | WsDataFrame
+  | WsCloseFrame
   | PingFrame
   | PongFrame;
 
