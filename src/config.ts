@@ -79,6 +79,20 @@ const RawConfigSchema = z.object({
   RATE_LIMIT_INVITE_PER_IP_MINUTE: z.coerce.number().int().positive().default(60),
 
   /**
+   * Anti-abuse caps on *new tunnel registrations* per source IP. Checked
+   * at WS upgrade time on /tunnel before we agree to assign a subdomain.
+   * Existing tunnels and the traffic flowing through them are NOT limited
+   * here — those are the legitimate volume.
+   *
+   * Defaults are deliberately tight (5/h, 10/d) on the assumption that a
+   * real iClaw user enables Remote Access a handful of times per day at
+   * most. Anyone bursting beyond is almost certainly abusing the relay
+   * as a free ngrok.
+   */
+  TUNNEL_LIMIT_PER_HOUR: z.coerce.number().int().positive().default(5),
+  TUNNEL_LIMIT_PER_DAY: z.coerce.number().int().positive().default(10),
+
+  /**
    * If true, log tunnel register/connect/disconnect events (subdomain,
    * ip-hash). NEVER logs request/response bodies regardless of this flag.
    */
@@ -156,6 +170,8 @@ export const config = Object.freeze({
   limits: Object.freeze({
     registerPerIpPerHour: raw.RATE_LIMIT_REGISTER_PER_IP_HOUR,
     invitePerIpPerMinute: raw.RATE_LIMIT_INVITE_PER_IP_MINUTE,
+    tunnelPerIpPerHour: raw.TUNNEL_LIMIT_PER_HOUR,
+    tunnelPerIpPerDay: raw.TUNNEL_LIMIT_PER_DAY,
   }),
 
   logAccess: raw.LOG_ACCESS,
