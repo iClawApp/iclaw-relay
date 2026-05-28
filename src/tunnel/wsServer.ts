@@ -51,6 +51,23 @@ function getClientIp(req: IncomingMessage): string {
   return req.socket.remoteAddress ?? 'unknown';
 }
 
+/**
+ * Whether an IP is a loopback / same-host address. Loopback connections
+ * are by definition coming from the machine the relay runs on — it owns
+ * the relay anyway, there's no abuse vector to defend against, and
+ * applying a per-IP cap there only ever breaks legitimate dev
+ * (multiple tunnels + reconnects all share 127.0.0.1).
+ */
+function isLoopbackIp(ip: string): boolean {
+  return (
+    ip === '127.0.0.1' ||
+    ip === '::1' ||
+    ip === '::ffff:127.0.0.1' ||
+    ip.startsWith('127.') ||
+    ip.startsWith('::ffff:127.')
+  );
+}
+
 export function attachTunnelWs(server: HttpServer): void {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 
@@ -60,26 +77,31 @@ export function attachTunnelWs(server: HttpServer): void {
     // (1) Outbound iClaw client registering a new tunnel.
     if (url.pathname === TUNNEL_PATH) {
       const ip = getClientIp(req);
-      const limit = checkAndCountTunnelRegistration(ip, {
-        perHour: config.limits.tunnelPerIpPerHour,
-        perDay: config.limits.tunnelPerIpPerDay,
-      });
-      if (!limit.ok) {
-        // RFC 6585 §4. Counted before the upgrade so abusers don't get a
-        // tunnel allocated, hub entry created, etc.
-        const retryAfter = limit.retryAfterSec ?? 3600;
-        console.warn(
-          `[tunnel] rate-limited ip=${ip} reason=${limit.reason} retry-after=${retryAfter}s`,
-        );
-        socket.write(
-          `HTTP/1.1 429 Too Many Requests\r\n` +
-          `Retry-After: ${retryAfter}\r\n` +
-          `Connection: close\r\n` +
-          `Content-Length: 0\r\n\r\n`,
-        );
-        socket.destroy();
-        return;
+
+      // Loopback never rate-limited (see isLoopbackIp comment).
+      if (!isLoopbackIp(ip)) {
+        const limit = checkAndCountTunnelRegistration(ip, {
+          perHour: config.limits.tunnelPerIpPerHour,
+          perDay: config.limits.tunnelPerIpPerDay,
+        });
+        if (!limit.ok) {
+          // RFC 6585 §4. Counted before the upgrade so abusers don't
+          // get a tunnel allocated, hub entry created, etc.
+          const retryAfter = limit.retryAfterSec ?? 3600;
+          console.warn(
+            `[tunnel] rate-limited ip=${ip} reason=${limit.reason} retry-after=${retryAfter}s`,
+          );
+          socket.write(
+            `HTTP/1.1 429 Too Many Requests\r\n` +
+            `Retry-After: ${retryAfter}\r\n` +
+            `Connection: close\r\n` +
+            `Content-Length: 0\r\n\r\n`,
+          );
+          socket.destroy();
+          return;
+        }
       }
+
       wss.handleUpgrade(req, socket, head, (ws) => handleTunnel(ws));
       return;
     }

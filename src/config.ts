@@ -84,13 +84,15 @@ const RawConfigSchema = z.object({
    * Existing tunnels and the traffic flowing through them are NOT limited
    * here — those are the legitimate volume.
    *
-   * Defaults are deliberately tight (5/h, 10/d) on the assumption that a
-   * real iClaw user enables Remote Access a handful of times per day at
-   * most. Anyone bursting beyond is almost certainly abusing the relay
-   * as a free ngrok.
+   * Defaults are kept loose enough to absorb reasonable reconnect
+   * behaviour from a real user with several active tunnels (each WS
+   * reconnect currently counts as a new registration). Tighten in prod
+   * if you see actual abuse.
+   *
+   * Loopback IPs (127.0.0.1 / ::1) are exempt entirely — see wsServer.ts.
    */
-  TUNNEL_LIMIT_PER_HOUR: z.coerce.number().int().positive().default(5),
-  TUNNEL_LIMIT_PER_DAY: z.coerce.number().int().positive().default(10),
+  TUNNEL_LIMIT_PER_HOUR: z.coerce.number().int().positive().default(20),
+  TUNNEL_LIMIT_PER_DAY: z.coerce.number().int().positive().default(60),
 
   /**
    * If true, log tunnel register/connect/disconnect events (subdomain,
