@@ -92,6 +92,19 @@ export const HOP_BY_HOP_HEADERS = new Set([
   'content-length', // re-derived on the receiving side
 ]);
 
+/**
+ * Internal-only headers used between the relay and the local iClaw. We
+ * MUST strip any incoming `x-iclaw-*` from the public request before
+ * forwarding through the tunnel — otherwise a public client could forge
+ * e.g. `x-iclaw-tunneled` or any other internal signalling header that
+ * the local iClaw might trust.
+ *
+ * The local iClaw injects its own copies of these headers on the loopback
+ * side after the tunnel hands the request off, so legitimate signalling
+ * still works.
+ */
+export const INTERNAL_HEADER_PREFIX = 'x-iclaw-';
+
 export function stripHopByHopHeaders(
   headers: Record<string, string | string[] | undefined>,
 ): Record<string, string> {
@@ -100,6 +113,7 @@ export function stripHopByHopHeaders(
     if (v === undefined) continue;
     const lower = k.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (lower.startsWith(INTERNAL_HEADER_PREFIX)) continue;
     out[lower] = Array.isArray(v) ? v.join(', ') : v;
   }
   return out;
