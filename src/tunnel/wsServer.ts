@@ -47,6 +47,11 @@ import {
 } from './protocol';
 import { bridgePublicUpgrade, deliverWsData, deliverWsClose } from './publicWs';
 import { checkAndCountTunnelRegistration } from './rateLimit';
+import { isValidTokenHashFormat } from './accessToken';
+import {
+  evaluateTunnelAccessFromIncoming,
+  refuseUpgradeSocket,
+} from './accessGate';
 
 /** Interval between WS-protocol-level keep-alive pings on each iClaw conn. */
 const KEEP_ALIVE_MS = 30_000;
@@ -104,6 +109,11 @@ export function attachTunnelWs(server: HttpServer): void {
       if (!tunnel) {
         socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
         socket.destroy();
+        return;
+      }
+      const access = evaluateTunnelAccessFromIncoming(tunnel, req);
+      if (access.action === 'forbidden') {
+        refuseUpgradeSocket(socket);
         return;
       }
       bridgePublicUpgrade(tunnel, req, socket, head);
@@ -227,18 +237,41 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     return;
   }
 
-  // (1) Already active on this connection? Idempotent — same subdomain.
+  const tokenHash = frame.tokenHash;
+  if (typeof tokenHash !== 'string' || !isValidTokenHashFormat(tokenHash)) {
+    sendRejected(conn, tunnelId, 'invalid tokenHash');
+    return;
+  }
+
+  // (1) Already active on this connection? Idempotent re-register, and the
+  // owner is allowed to ROTATE its access token: a register with a changed
+  // tokenHash updates the stored hash and drops the current access session
+  // so previously-issued ?access= links and access cookies stop working.
+  // This is safe because register-tunnel only ever arrives over the
+  // authenticated iClaw WS that owns this tunnelId.
   const existing = getTunnelByTunnelId(conn, tunnelId);
   if (existing) {
+    if (existing.tokenHash !== tokenHash) {
+      existing.tokenHash = tokenHash;
+      existing.accessSession = null;
+      if (config.logAccess) {
+        console.log(`[tunnel] rotate-token tunnelId=${tunnelId} subdomain=${existing.subdomain}`);
+      }
+    }
     sendRegistered(conn, existing);
     return;
   }
 
   // (2) Sticky subdomain: tunnel currently in the reconnecting grace
   // window with the same tunnelId? Attach it to this new connection so
-  // the URL is preserved. Doesn't count against the rate limit.
+  // the URL is preserved. Doesn't count against the rate limit. A changed
+  // tokenHash here is also treated as a rotation (kills old access).
   const restored = tryRestoreTunnel(tunnelId, conn);
   if (restored) {
+    if (restored.tokenHash !== tokenHash) {
+      restored.accessSession = null;
+    }
+    restored.tokenHash = tokenHash;
     if (config.logAccess) {
       console.log(
         `[tunnel] restore tunnelId=${tunnelId} subdomain=${restored.subdomain} ip=${conn.ip}`,
@@ -273,6 +306,8 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     streams: new Map(),
     reconnecting: false,
     evictTimer: null,
+    tokenHash,
+    accessSession: null,
   };
   addTunnel(tunnel);
 

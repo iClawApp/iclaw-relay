@@ -24,6 +24,7 @@ import {
 } from './protocol';
 import { renderTunnelNotFoundPage } from './tunnelNotFoundPage';
 import { renderReconnectingPage } from './reconnectingPage';
+import { applyHttpAccessGate } from './accessGate';
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -50,6 +51,10 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
   if (tunnel.reconnecting || !tunnel.conn || tunnel.conn.ws.readyState !== 1) {
     res.status(503).setHeader('Retry-After', '5');
     res.type('html').send(renderReconnectingPage());
+    return;
+  }
+
+  if (!applyHttpAccessGate(tunnel, req, res)) {
     return;
   }
 

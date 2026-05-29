@@ -24,6 +24,8 @@ export interface RegisterTunnelFrame {
   t: 'register-tunnel';
   tunnelId: string;
   label?: string | null;
+  /** SHA-256(access token) base64url — relay stores hash only, never plaintext. */
+  tokenHash: string;
 }
 
 /** relay → iClaw: subdomain assigned. Sent in response to register-tunnel. */

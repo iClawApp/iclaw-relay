@@ -54,6 +54,10 @@ export interface Tunnel {
   reconnecting: boolean;
   /** Set when reconnecting — fires to fully delete after grace window. */
   evictTimer: NodeJS.Timeout | null;
+  /** SHA-256(access token) base64url — relay never stores plaintext token. */
+  tokenHash: string | null;
+  /** Issued after successful ?access= check; validated via HttpOnly cookie. */
+  accessSession: string | null;
 }
 
 const tunnelsBySubdomain = new Map<string, Tunnel>();
@@ -152,6 +156,8 @@ export function removeTunnelBySubdomain(subdomain: string): void {
     t.conn.subdomains.delete(subdomain);
     t.conn.tunnelIdToSubdomain.delete(t.tunnelId);
   }
+  t.tokenHash = null;
+  t.accessSession = null;
   fullyRemove(t);
 }
 
