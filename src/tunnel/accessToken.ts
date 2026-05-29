@@ -50,6 +50,23 @@ export function mintAccessSessionValue(): string {
   return randomBytes(32).toString('base64url');
 }
 
+/**
+ * Upper bound on concurrent access sessions per tunnel. Generous enough for a
+ * person's devices/tabs while capping memory if a link is shared widely. When
+ * exceeded, the oldest session is evicted (insertion order).
+ */
+export const MAX_ACCESS_SESSIONS = 64;
+
+/** Record a freshly-minted access session, evicting the oldest past the cap. */
+export function addAccessSession(sessions: Set<string>, value: string): void {
+  sessions.add(value);
+  while (sessions.size > MAX_ACCESS_SESSIONS) {
+    const oldest = sessions.values().next().value;
+    if (oldest === undefined) break;
+    sessions.delete(oldest);
+  }
+}
+
 export function verifyAccessSession(provided: string, expected: string | null): boolean {
   if (!expected || !TOKEN_RE.test(provided)) return false;
   const a = Buffer.from(provided, 'utf8');
@@ -59,6 +76,22 @@ export function verifyAccessSession(provided: string, expected: string | null): 
     return false;
   }
   return timingSafeEqual(a, b);
+}
+
+/**
+ * Constant-time-ish membership check of a presented cookie session against the
+ * tunnel's set of valid sessions. Iterates the whole set (no early return) so
+ * timing does not reveal which session matched.
+ */
+export function verifyAccessSessionInSet(provided: string, sessions: Set<string>): boolean {
+  if (!TOKEN_RE.test(provided)) return false;
+  const a = Buffer.from(provided, 'utf8');
+  let matched = false;
+  for (const expected of sessions) {
+    const b = Buffer.from(expected, 'utf8');
+    if (a.length === b.length && timingSafeEqual(a, b)) matched = true;
+  }
+  return matched;
 }
 
 export function buildAccessCookieHeader(sessionValue: string, secure: boolean): string {

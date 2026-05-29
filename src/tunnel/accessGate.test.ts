@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 
 import type { Tunnel } from './hub';
-import { ACCESS_COOKIE_NAME, ACCESS_QUERY_PARAM } from './accessToken';
+import { ACCESS_COOKIE_NAME, ACCESS_QUERY_PARAM, MAX_ACCESS_SESSIONS } from './accessToken';
 import {
   applyHttpAccessGate,
   evaluateTunnelAccess,
@@ -26,7 +26,7 @@ function stubTunnel(overrides: Partial<Tunnel> = {}): Tunnel {
     reconnecting: false,
     evictTimer: null,
     tokenHash: FIXTURE_HASH,
-    accessSession: null,
+    accessSessions: new Set(),
     ...overrides,
   };
 }
@@ -48,7 +48,7 @@ describe('access token rotation (C2 regression)', () => {
       redirectOnToken: false,
     });
     expect(first.action).toBe('allow');
-    const oldSession = t.accessSession;
+    const oldSession = [...t.accessSessions][0];
     expect(oldSession).toBeTruthy();
 
     // The cookie works while the session is current.
@@ -64,7 +64,7 @@ describe('access token rotation (C2 regression)', () => {
     // --- iClaw rotates the access token (what handleRegister now does) ---
     const newToken = randomBytes(32).toString('base64url');
     t.tokenHash = createHash('sha256').update(newToken, 'utf8').digest('base64url');
-    t.accessSession = null;
+    t.accessSessions.clear();
 
     // Old ?access= token → forbidden.
     expect(
@@ -95,6 +95,68 @@ describe('access token rotation (C2 regression)', () => {
       redirectOnToken: false,
     });
     expect(after.action).toBe('allow');
+  });
+});
+
+describe('concurrent access sessions (M1)', () => {
+  it('two visitors activating the same link both keep working', () => {
+    const t = stubTunnel();
+
+    // Visitor A activates the link → session A.
+    const a = evaluateTunnelAccess(t, {
+      path: '/',
+      search: `?${ACCESS_QUERY_PARAM}=${FIXTURE_TOKEN}`,
+      cookieHeader: undefined,
+      secure: true,
+      redirectOnToken: false,
+    });
+    expect(a.action).toBe('allow');
+    const sessionA = [...t.accessSessions].at(-1) as string;
+
+    // Visitor B activates the same link → session B (does NOT evict A).
+    const b = evaluateTunnelAccess(t, {
+      path: '/',
+      search: `?${ACCESS_QUERY_PARAM}=${FIXTURE_TOKEN}`,
+      cookieHeader: undefined,
+      secure: true,
+      redirectOnToken: false,
+    });
+    expect(b.action).toBe('allow');
+    const sessionB = [...t.accessSessions].at(-1) as string;
+    expect(sessionB).not.toBe(sessionA);
+    expect(t.accessSessions.size).toBe(2);
+
+    // Both cookies remain valid concurrently.
+    expect(
+      evaluateTunnelAccess(t, {
+        path: '/',
+        search: '',
+        cookieHeader: cookieHeader(sessionA),
+        secure: true,
+      }),
+    ).toEqual({ action: 'allow' });
+    expect(
+      evaluateTunnelAccess(t, {
+        path: '/',
+        search: '',
+        cookieHeader: cookieHeader(sessionB),
+        secure: true,
+      }),
+    ).toEqual({ action: 'allow' });
+  });
+
+  it('bounds the number of stored sessions (oldest evicted past the cap)', () => {
+    const t = stubTunnel();
+    for (let i = 0; i < MAX_ACCESS_SESSIONS + 5; i++) {
+      evaluateTunnelAccess(t, {
+        path: '/',
+        search: `?${ACCESS_QUERY_PARAM}=${FIXTURE_TOKEN}`,
+        cookieHeader: undefined,
+        secure: true,
+        redirectOnToken: false,
+      });
+    }
+    expect(t.accessSessions.size).toBe(MAX_ACCESS_SESSIONS);
   });
 });
 
@@ -139,7 +201,7 @@ describe('evaluateTunnelAccess', () => {
     expect(decision.action).toBe('redirect');
     if (decision.action !== 'redirect') return;
     expect(decision.location).toBe('/chat?foo=1');
-    expect(t.accessSession).toBeTruthy();
+    expect(t.accessSessions.size).toBeGreaterThan(0);
     expect(decision.setCookie).toContain(ACCESS_COOKIE_NAME);
   });
 
@@ -155,12 +217,12 @@ describe('evaluateTunnelAccess', () => {
     expect(decision).toMatchObject({ action: 'allow' });
     if (decision.action !== 'allow') return;
     expect(decision.setCookie).toContain(ACCESS_COOKIE_NAME);
-    expect(t.accessSession).toBeTruthy();
+    expect(t.accessSessions.size).toBeGreaterThan(0);
   });
 
   it('allows subsequent requests with valid access cookie', () => {
     const session = randomBytes(32).toString('base64url');
-    const t = stubTunnel({ accessSession: session });
+    const t = stubTunnel({ accessSessions: new Set([session]) });
     expect(
       evaluateTunnelAccess(t, {
         path: '/',
@@ -172,7 +234,7 @@ describe('evaluateTunnelAccess', () => {
   });
 
   it('forbids stale or wrong session cookie', () => {
-    const t = stubTunnel({ accessSession: randomBytes(32).toString('base64url') });
+    const t = stubTunnel({ accessSessions: new Set([randomBytes(32).toString('base64url')]) });
     expect(
       evaluateTunnelAccess(t, {
         path: '/',
@@ -274,7 +336,7 @@ describe('applyHttpAccessGate', () => {
 
   it('returns true when session cookie is valid', () => {
     const session = randomBytes(32).toString('base64url');
-    const tunnel = stubTunnel({ accessSession: session });
+    const tunnel = stubTunnel({ accessSessions: new Set([session]) });
     const req = {
       path: '/login',
       originalUrl: '/login',

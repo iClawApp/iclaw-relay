@@ -12,8 +12,9 @@ import type { Tunnel } from './hub';
 import {
   ACCESS_QUERY_PARAM,
   ACCESS_COOKIE_NAME,
+  addAccessSession,
   buildAccessCookieHeader,
-  verifyAccessSession,
+  verifyAccessSessionInSet,
   verifyAccessToken,
   mintAccessSessionValue,
 } from './accessToken';
@@ -54,7 +55,7 @@ function requestIsSecure(req: { headers: Record<string, unknown>; protocol?: str
 
 /**
  * Evaluate whether a public request may reach the tunnel backend.
- * Mutates `tunnel.accessSession` when a valid ?access= token is presented.
+ * Adds to `tunnel.accessSessions` when a valid ?access= token is presented.
  */
 export function evaluateTunnelAccess(
   tunnel: Tunnel,
@@ -73,7 +74,7 @@ export function evaluateTunnelAccess(
 
   const cookies = parseCookies(opts.cookieHeader);
   const session = cookies[ACCESS_COOKIE_NAME];
-  if (session && verifyAccessSession(session, tunnel.accessSession)) {
+  if (session && verifyAccessSessionInSet(session, tunnel.accessSessions)) {
     return { action: 'allow' };
   }
 
@@ -84,7 +85,7 @@ export function evaluateTunnelAccess(
       return { action: 'forbidden' };
     }
     const sessionValue = mintAccessSessionValue();
-    tunnel.accessSession = sessionValue;
+    addAccessSession(tunnel.accessSessions, sessionValue);
     const setCookie = buildAccessCookieHeader(sessionValue, opts.secure);
     if (opts.redirectOnToken !== false) {
       const clean = stripAccessFromUrl(opts.path, opts.search);

@@ -253,7 +253,7 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
   if (existing) {
     if (existing.tokenHash !== tokenHash) {
       existing.tokenHash = tokenHash;
-      existing.accessSession = null;
+      existing.accessSessions.clear();
       if (config.logAccess) {
         console.log(`[tunnel] rotate-token tunnelId=${tunnelId} subdomain=${existing.subdomain}`);
       }
@@ -269,7 +269,7 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
   const restored = tryRestoreTunnel(tunnelId, conn);
   if (restored) {
     if (restored.tokenHash !== tokenHash) {
-      restored.accessSession = null;
+      restored.accessSessions.clear();
     }
     restored.tokenHash = tokenHash;
     if (config.logAccess) {
@@ -307,7 +307,7 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     reconnecting: false,
     evictTimer: null,
     tokenHash,
-    accessSession: null,
+    accessSessions: new Set(),
   };
   addTunnel(tunnel);
 

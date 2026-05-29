@@ -56,8 +56,13 @@ export interface Tunnel {
   evictTimer: NodeJS.Timeout | null;
   /** SHA-256(access token) base64url — relay never stores plaintext token. */
   tokenHash: string | null;
-  /** Issued after successful ?access= check; validated via HttpOnly cookie. */
-  accessSession: string | null;
+  /**
+   * Access sessions issued after a successful ?access= check, validated via
+   * the HttpOnly cookie. A SET (not a single value) so multiple devices /
+   * tabs can hold the gate concurrently — one visitor activating the link no
+   * longer evicts another. Bounded + cleared on token rotation.
+   */
+  accessSessions: Set<string>;
 }
 
 const tunnelsBySubdomain = new Map<string, Tunnel>();
@@ -157,7 +162,7 @@ export function removeTunnelBySubdomain(subdomain: string): void {
     t.conn.tunnelIdToSubdomain.delete(t.tunnelId);
   }
   t.tokenHash = null;
-  t.accessSession = null;
+  t.accessSessions.clear();
   fullyRemove(t);
 }
 
