@@ -111,6 +111,17 @@ const RawConfigSchema = z.object({
     .string()
     .transform((v) => v === 'true' || v === '1')
     .default('false'),
+
+  /**
+   * TEST-ONLY: append a JSONL record of everything the relay forwards
+   * (outer public request headers + the req/res frame bodies it sees) to
+   * this file. Used by the E2E integration test to prove the relay only
+   * ever handles ciphertext and to detect cookie/passphrase leakage.
+   *
+   * Refused unless NODE_ENV=test — this captures raw forwarded traffic and
+   * must never be enabled in production. Empty string disables it.
+   */
+  RELAY_CAPTURE_FILE: z.string().optional().default(''),
 });
 
 /* ---------------------------------------------------------------- parse -- */
@@ -178,6 +189,15 @@ export const config = Object.freeze({
 
   logAccess: raw.LOG_ACCESS,
   trustProxy: raw.TRUST_PROXY,
+
+  /**
+   * TEST-ONLY capture file (see RELAY_CAPTURE_FILE). Hard-gated to test mode:
+   * even if the env var is set, it is ignored outside NODE_ENV=test so it can
+   * never silently start logging raw traffic in production.
+   */
+  captureFile: raw.NODE_ENV === 'test' && raw.RELAY_CAPTURE_FILE.trim() !== ''
+    ? raw.RELAY_CAPTURE_FILE.trim()
+    : null,
 });
 
 /** Public type so callers can declare config-shaped params. */

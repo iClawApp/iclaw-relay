@@ -25,6 +25,7 @@ import {
 import { renderTunnelNotFoundPage } from './tunnelNotFoundPage';
 import { renderReconnectingPage } from './reconnectingPage';
 import { applyHttpAccessGate } from './accessGate';
+import { captureEnabled, captureRelayFrame } from './captureFrame';
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -107,6 +108,23 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
       }
 
       const resFrame = frame as ResFrame;
+
+      if (captureEnabled()) {
+        captureRelayFrame({
+          subdomain,
+          tunnelId: tunnel.tunnelId,
+          outer: {
+            method: req.method,
+            path: req.originalUrl,
+            headers: req.headers as Record<string, unknown>,
+          },
+          reqBodyB64: reqFrame.body,
+          resBodyB64: resFrame.body ?? '',
+          status: resFrame.status,
+          ts: Date.now(),
+        });
+      }
+
       res.status(resFrame.status);
       for (const [k, v] of Object.entries(resFrame.headers)) {
         res.setHeader(k, v);
