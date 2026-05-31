@@ -1,6 +1,6 @@
 {
   "name": "iclaw-relay",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tunnel relay for iClaw Remote Access. Byte-forwarding only — never reads payloads; auth is verified end-to-end between browser and local iClaw.",
   "private": true,
   "license": "MIT",
