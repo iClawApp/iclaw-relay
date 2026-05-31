@@ -95,6 +95,21 @@ function main(): void {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // Last-resort safety net. The relay is a stateless byte-forwarder: every
+  // request/connection is independent, so a single unexpected throw must NOT
+  // be allowed to abort the whole process and take every live tunnel down
+  // with it. Without this, a malformed request that escapes a handler (e.g.
+  // inside the raw `server.on('upgrade')` path) combined with
+  // `systemd Restart=always` becomes a trivial remote crash-loop DoS. Log
+  // loudly and keep serving; if the failure is genuinely fatal the process
+  // will fall over on the next operation anyway.
+  process.on('uncaughtException', (err) => {
+    console.error(`[iclaw-relay] uncaughtException: ${err?.stack ?? err}`);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error(`[iclaw-relay] unhandledRejection: ${reason instanceof Error ? reason.stack : reason}`);
+  });
 }
 
 main();

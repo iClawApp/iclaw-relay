@@ -33,7 +33,18 @@ function parseCookies(header: string | undefined): Record<string, string> {
     if (eq < 0) continue;
     const name = part.slice(0, eq).trim();
     const value = part.slice(eq + 1).trim();
-    if (name) out[name] = decodeURIComponent(value);
+    if (!name) continue;
+    // A malformed percent-escape (e.g. `%`, `%ZZ`) makes decodeURIComponent
+    // throw URIError. On the HTTP path Express would catch it, but on the WS
+    // upgrade path the exception escapes the `server.on('upgrade')` listener
+    // and crashes the whole process (taking every tunnel down). Decode
+    // defensively per-cookie and fall back to the raw value so one attacker-
+    // supplied cookie can never abort the gate.
+    try {
+      out[name] = decodeURIComponent(value);
+    } catch {
+      out[name] = value;
+    }
   }
   return out;
 }
@@ -105,16 +116,24 @@ export function evaluateTunnelAccessFromIncoming(
   tunnel: Tunnel,
   req: IncomingMessage,
 ): AccessDecision {
-  const url = new URL(req.url ?? '/', 'http://tunnel.local');
-  return evaluateTunnelAccess(tunnel, {
-    path: url.pathname,
-    search: url.search,
-    cookieHeader: typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined,
-    secure: requestIsSecure({
-      headers: req.headers as Record<string, unknown>,
-    }),
-    redirectOnToken: false,
-  });
+  // Runs inside the raw `server.on('upgrade')` listener, where a thrown
+  // exception is an unhandled process crash rather than a 500. A hostile
+  // client controls req.url and the Cookie header, so treat any parse failure
+  // (malformed percent-escape, bad URL) as fail-closed → forbidden.
+  try {
+    const url = new URL(req.url ?? '/', 'http://tunnel.local');
+    return evaluateTunnelAccess(tunnel, {
+      path: url.pathname,
+      search: url.search,
+      cookieHeader: typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined,
+      secure: requestIsSecure({
+        headers: req.headers as Record<string, unknown>,
+      }),
+      redirectOnToken: false,
+    });
+  } catch {
+    return { action: 'forbidden' };
+  }
 }
 
 /** Apply gate to an Express HTTP request (before tunnel proxy forward). */
@@ -124,13 +143,20 @@ export function applyHttpAccessGate(
   res: Response,
 ): boolean {
   const q = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
-  const decision = evaluateTunnelAccess(tunnel, {
-    path: req.path,
-    search: q,
-    cookieHeader: typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined,
-    secure: requestIsSecure(req),
-    redirectOnToken: true,
-  });
+  let decision: AccessDecision;
+  try {
+    decision = evaluateTunnelAccess(tunnel, {
+      path: req.path,
+      search: q,
+      cookieHeader: typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined,
+      secure: requestIsSecure(req),
+      redirectOnToken: true,
+    });
+  } catch {
+    // Malformed URL/cookie → fail closed with a clean 403 rather than bubbling
+    // a 500 through the error handler.
+    decision = { action: 'forbidden' };
+  }
 
   if (decision.action === 'allow') {
     if (decision.setCookie) res.setHeader('Set-Cookie', decision.setCookie);

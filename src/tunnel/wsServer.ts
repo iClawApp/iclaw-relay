@@ -31,7 +31,7 @@ import {
   getTunnelByTunnelIdGlobal,
   removeTunnelBySubdomain,
   detachConnAndKeepReserved,
-  tryRestoreTunnel,
+  reassignTunnelToConn,
   type IclawConnection,
   type Tunnel,
 } from './hub';
@@ -47,7 +47,12 @@ import {
 } from './protocol';
 import { bridgePublicUpgrade, deliverWsData, deliverWsClose } from './publicWs';
 import { checkAndCountTunnelRegistration } from './rateLimit';
-import { isValidTokenHashFormat } from './accessToken';
+import {
+  isValidTokenHashFormat,
+  isValidOwnerProofFormat,
+  verifyOwnerSecret,
+  hashOwnerSecret,
+} from './accessToken';
 import {
   evaluateTunnelAccessFromIncoming,
   refuseUpgradeSocket,
@@ -58,13 +63,31 @@ const KEEP_ALIVE_MS = 30_000;
 
 const TUNNEL_PATH = '/tunnel';
 
+function firstHeader(v: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(v) ? v[0] : v;
+  return typeof raw === 'string' ? raw : undefined;
+}
+
 function getClientIp(req: IncomingMessage): string {
   if (config.trustProxy) {
-    const xff = req.headers['x-forwarded-for'];
-    const raw = Array.isArray(xff) ? xff[0] : xff;
-    if (typeof raw === 'string') {
-      const first = raw.split(',')[0]?.trim();
-      if (first) return first;
+    // SECURITY: the left-most X-Forwarded-For entry is fully attacker-
+    // controlled — a client can send `X-Forwarded-For: 127.0.0.1` and our
+    // upstream (Cloudflare) merely *appends* the real client IP, so trusting
+    // XFF[0] let anyone forge a loopback/arbitrary IP and bypass the per-IP
+    // tunnel-registration limits (and poison logs).
+    //
+    // Behind Cloudflare the trustworthy value is `CF-Connecting-IP`, which the
+    // edge overwrites unconditionally and the client cannot spoof. Prefer it;
+    // fall back to the RIGHT-most XFF hop (the one our nearest trusted proxy
+    // added) rather than the left-most.
+    const cf = firstHeader(req.headers['cf-connecting-ip'])?.trim();
+    if (cf) return cf;
+
+    const xff = firstHeader(req.headers['x-forwarded-for']);
+    if (xff) {
+      const parts = xff.split(',').map((s) => s.trim()).filter(Boolean);
+      const rightMost = parts[parts.length - 1];
+      if (rightMost) return rightMost;
     }
   }
   return req.socket.remoteAddress ?? 'unknown';
@@ -87,6 +110,21 @@ function safeSend(ws: WebSocket, payload: string): void {
   } catch {
     // ignore
   }
+}
+
+/**
+ * Pick a subdomain that is not already taken. The namespace is ~1.5B wide so a
+ * clash is astronomically unlikely, but `addTunnel` would silently overwrite an
+ * existing tunnel's registry entry on a collision (hijacking its URL), so never
+ * hand back one that is in use. Returns null only if we somehow can't find a
+ * free name in a handful of tries.
+ */
+function allocateSubdomain(): string | null {
+  for (let i = 0; i < 8; i++) {
+    const candidate = generateSubdomain();
+    if (!getTunnelBySubdomain(candidate)) return candidate;
+  }
+  return null;
 }
 
 export function attachTunnelWs(server: HttpServer): void {
@@ -243,6 +281,13 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     return;
   }
 
+  // Ownership proof (optional for backward compat). Validate shape up-front;
+  // its hash authenticates a re-register against the stored owner hash.
+  const ownerProof =
+    typeof frame.ownerProof === 'string' && isValidOwnerProofFormat(frame.ownerProof)
+      ? frame.ownerProof
+      : null;
+
   // (1) Already active on this connection? Idempotent re-register, and the
   // owner is allowed to ROTATE its access token: a register with a changed
   // tokenHash updates the stored hash and drops the current access session
@@ -255,30 +300,54 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
       existing.tokenHash = tokenHash;
       existing.accessSessions.clear();
       if (config.logAccess) {
-        console.log(`[tunnel] rotate-token tunnelId=${tunnelId} subdomain=${existing.subdomain}`);
+        // Never log tunnelId — subdomain is already public and enough to trace.
+        console.log(`[tunnel] rotate-token subdomain=${existing.subdomain}`);
       }
     }
     sendRegistered(conn, existing);
     return;
   }
 
-  // (2) Sticky subdomain: tunnel currently in the reconnecting grace
-  // window with the same tunnelId? Attach it to this new connection so
-  // the URL is preserved. Doesn't count against the rate limit. A changed
-  // tokenHash here is also treated as a rotation (kills old access).
-  const restored = tryRestoreTunnel(tunnelId, conn);
-  if (restored) {
-    if (restored.tokenHash !== tokenHash) {
-      restored.accessSessions.clear();
+  // (2) A tunnel with this id exists but on a DIFFERENT connection — either in
+  // the reconnecting grace window or still bound to a stale socket. This is the
+  // hijack-sensitive path: a stranger who only knows the tunnelId must NOT be
+  // able to claim it, so require a matching ownership proof whenever the tunnel
+  // carries an owner hash.
+  const claimable = getTunnelByTunnelIdGlobal(tunnelId);
+  if (claimable && claimable.conn !== conn) {
+    if (claimable.ownerHash) {
+      if (!ownerProof || !verifyOwnerSecret(ownerProof, claimable.ownerHash)) {
+        // Throttle tunnelId brute-force like a fresh registration, then refuse
+        // WITHOUT mutating the tunnel — the real owner keeps its subdomain.
+        if (!isLoopbackIp(conn.ip)) {
+          checkAndCountTunnelRegistration(conn.ip, {
+            perHour: config.limits.tunnelPerIpPerHour,
+            perDay: config.limits.tunnelPerIpPerDay,
+          });
+        }
+        console.warn(`[tunnel] restore denied (ownership mismatch) ip=${conn.ip}`);
+        sendRejected(conn, tunnelId, 'ownership proof required');
+        return;
+      }
     }
-    restored.tokenHash = tokenHash;
-    if (config.logAccess) {
-      console.log(
-        `[tunnel] restore tunnelId=${tunnelId} subdomain=${restored.subdomain} ip=${conn.ip}`,
-      );
+    const restored = reassignTunnelToConn(tunnelId, conn);
+    if (restored) {
+      if (restored.tokenHash !== tokenHash) {
+        restored.accessSessions.clear();
+      }
+      restored.tokenHash = tokenHash;
+      // Adopt an owner hash if the tunnel had none (legacy) and a proof is now
+      // supplied, so subsequent restores are authenticated.
+      if (!restored.ownerHash && ownerProof) {
+        restored.ownerHash = hashOwnerSecret(ownerProof);
+      }
+      if (config.logAccess) {
+        console.log(`[tunnel] restore subdomain=${restored.subdomain} ip=${conn.ip}`);
+      }
+      sendRegistered(conn, restored);
+      return;
     }
-    sendRegistered(conn, restored);
-    return;
+    // Fell through (raced away) — drop to a fresh registration below.
   }
 
   // (3) Fresh registration. Rate-limited (loopback exempt).
@@ -296,7 +365,11 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     }
   }
 
-  const subdomain = generateSubdomain();
+  const subdomain = allocateSubdomain();
+  if (!subdomain) {
+    sendRejected(conn, tunnelId, 'subdomain allocation failed');
+    return;
+  }
   const tunnel: Tunnel = {
     subdomain,
     tunnelId,
@@ -307,12 +380,13 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
     reconnecting: false,
     evictTimer: null,
     tokenHash,
+    ownerHash: ownerProof ? hashOwnerSecret(ownerProof) : null,
     accessSessions: new Set(),
   };
   addTunnel(tunnel);
 
   if (config.logAccess) {
-    console.log(`[tunnel] register tunnelId=${tunnelId} subdomain=${subdomain} ip=${conn.ip}`);
+    console.log(`[tunnel] register subdomain=${subdomain} ip=${conn.ip}`);
   }
   sendRegistered(conn, tunnel);
 }
@@ -327,7 +401,7 @@ function handleUnregister(conn: IclawConnection, frame: UnregisterTunnelFrame): 
   if (!tunnel) return;
   removeTunnelBySubdomain(tunnel.subdomain);
   if (config.logAccess) {
-    console.log(`[tunnel] unregister tunnelId=${frame.tunnelId} subdomain=${tunnel.subdomain}`);
+    console.log(`[tunnel] unregister subdomain=${tunnel.subdomain}`);
   }
 }
 

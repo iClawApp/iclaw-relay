@@ -50,6 +50,26 @@ export function mintAccessSessionValue(): string {
   return randomBytes(32).toString('base64url');
 }
 
+/* ------------------------------------------------- tunnel ownership ------ */
+
+/**
+ * Tunnel ownership secret hashing/verification. Same construction as the
+ * access token (SHA-256 → base64url, constant-time compare) but a distinct
+ * purpose: it authenticates that a re-registering client owns the tunnelId,
+ * blocking subdomain hijack via reconnect-restore or token rotation.
+ */
+export function hashOwnerSecret(proof: string): string {
+  return hashAccessToken(proof);
+}
+
+export function isValidOwnerProofFormat(proof: string): boolean {
+  return TOKEN_RE.test(proof);
+}
+
+export function verifyOwnerSecret(proof: string, storedHash: string): boolean {
+  return verifyAccessToken(proof, storedHash);
+}
+
 /**
  * Upper bound on concurrent access sessions per tunnel. Generous enough for a
  * person's devices/tabs while capping memory if a link is shared widely. When

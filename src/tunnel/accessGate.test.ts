@@ -26,6 +26,7 @@ function stubTunnel(overrides: Partial<Tunnel> = {}): Tunnel {
     reconnecting: false,
     evictTimer: null,
     tokenHash: FIXTURE_HASH,
+    ownerHash: null,
     accessSessions: new Set(),
     ...overrides,
   };

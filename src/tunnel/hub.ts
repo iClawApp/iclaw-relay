@@ -57,6 +57,14 @@ export interface Tunnel {
   /** SHA-256(access token) base64url — relay never stores plaintext token. */
   tokenHash: string | null;
   /**
+   * SHA-256(tunnel ownership secret) base64url, or null for tunnels first
+   * registered by a legacy client that sent no ownerProof. When non-null, a
+   * reconnect-restore or token rotation for this tunnelId MUST present a
+   * matching ownerProof — this is what stops a stranger who knows only the
+   * tunnelId from hijacking the subdomain.
+   */
+  ownerHash: string | null;
+  /**
    * Access sessions issued after a successful ?access= check, validated via
    * the HttpOnly cookie. A SET (not a single value) so multiple devices /
    * tabs can hold the gate concurrently — one visitor activating the link no
@@ -162,6 +170,7 @@ export function removeTunnelBySubdomain(subdomain: string): void {
     t.conn.tunnelIdToSubdomain.delete(t.tunnelId);
   }
   t.tokenHash = null;
+  t.ownerHash = null;
   t.accessSessions.clear();
   fullyRemove(t);
 }
@@ -188,16 +197,33 @@ export function detachConnAndKeepReserved(conn: IclawConnection): void {
 }
 
 /**
- * Attempt to revive a reconnecting tunnel for `tunnelId` on a fresh
- * connection. Returns the resurrected tunnel on success, undefined when
- * there is no matching reconnecting tunnel to restore.
+ * Move an existing tunnel onto `conn`, preserving its subdomain. Handles both
+ * cases that a re-registering iClaw can hit:
+ *   - the tunnel is in the reconnecting grace window (normal sticky restore);
+ *   - the tunnel is still bound to a now-stale connection (e.g. the old socket
+ *     hasn't been reaped yet) — we detach it there first so a live tunnel's
+ *     registry entry is never silently orphaned.
+ *
+ * Returns the tunnel, or undefined when no tunnel with that id exists.
+ *
+ * SECURITY: this performs NO ownership check. The caller (handleRegister) must
+ * verify the ownerProof against `tunnel.ownerHash` before calling, otherwise
+ * any connection could claim any tunnelId.
  */
-export function tryRestoreTunnel(
+export function reassignTunnelToConn(
   tunnelId: string,
   conn: IclawConnection,
 ): Tunnel | undefined {
   const t = tunnelsByTunnelId.get(tunnelId);
-  if (!t || !t.reconnecting) return undefined;
+  if (!t) return undefined;
+  // Detach from a previous, different connection if one is still attached.
+  if (t.conn && t.conn !== conn) {
+    t.conn.subdomains.delete(t.subdomain);
+    t.conn.tunnelIdToSubdomain.delete(t.tunnelId);
+  }
+  // Close any per-connection state tied to the previous owner (in-flight
+  // requests / public WS streams). No-op if it was already reconnecting.
+  detachConnState(t);
   if (t.evictTimer) {
     clearTimeout(t.evictTimer);
     t.evictTimer = null;

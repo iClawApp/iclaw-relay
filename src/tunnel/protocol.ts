@@ -26,6 +26,17 @@ export interface RegisterTunnelFrame {
   label?: string | null;
   /** SHA-256(access token) base64url — relay stores hash only, never plaintext. */
   tokenHash: string;
+  /**
+   * Tunnel ownership secret (base64url, ≥128-bit). Proves the registering
+   * client is the same iClaw that originally created this tunnelId, so a
+   * stranger who merely guesses/observes the (low-entropy) tunnelId cannot
+   * hijack the subdomain via a reconnect "restore" or rotate its access token.
+   *
+   * The relay stores only SHA-256(ownerProof). Optional for backward compat:
+   * tunnels first registered without it carry a null owner hash and keep the
+   * legacy (unauthenticated) restore behaviour.
+   */
+  ownerProof?: string;
 }
 
 /** relay → iClaw: subdomain assigned. Sent in response to register-tunnel. */

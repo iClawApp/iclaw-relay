@@ -29,10 +29,37 @@ import { captureEnabled, captureRelayFrame } from './captureFrame';
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
+/**
+ * Hard cap on a single forwarded request body. Two reasons:
+ *  - Unbounded buffering lets a few concurrent large POSTs exhaust relay RAM.
+ *  - The forwarded `req` frame base64-encodes the body (+~33%) and wraps it in
+ *    JSON, all sent over the shared iClaw control WS whose `maxPayload` is
+ *    16 MiB. A body that crosses that ceiling would kill the control socket —
+ *    taking *every* tunnel on it down, not just this request. Keep the limit
+ *    comfortably below 16 MiB once base64 + JSON overhead is accounted for.
+ */
+const MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
+
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super('request body too large');
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
 async function readRequestBody(req: Parameters<RequestHandler>[0]): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_REQUEST_BODY_BYTES) {
+        reject(new PayloadTooLargeError());
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
@@ -137,7 +164,11 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'tunnel error';
       if (!res.headersSent) {
-        res.status(504).type('text/plain').send(`gateway timeout: ${message}`);
+        if (err instanceof PayloadTooLargeError) {
+          res.status(413).type('text/plain').send('payload too large');
+        } else {
+          res.status(504).type('text/plain').send(`gateway timeout: ${message}`);
+        }
       } else {
         res.end();
       }
