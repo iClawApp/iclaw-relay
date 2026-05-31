@@ -1,15 +1,17 @@
 /**
  * iclaw-relay entry point.
  *
- *   /healthz   → liveness probe
+ *   /healthz                     → liveness probe (apex domain)
+ *   ws  /tunnel                  → outbound-WS endpoint for local iClaw instances
+ *   any  <sub>.<baseDomain>/*    → forwarded to the matching tunnel
  *
- * Tunnel routing (outbound-WS hub + per-subdomain forwarding) lands on the
- * `dev` branch as follow-up work; the skeleton here just stands up the HTTP
- * surface and middleware stack.
- *
- * Order matters: helmet + cors run before routes, error handler is last.
+ * Order matters: helmet + cors run before routes, the tunnel proxy is the
+ * catch-all just before the error handler. We deliberately do NOT install
+ * express.json globally — the proxy needs the raw request body for any
+ * content type, so JSON parsing belongs on specific routes only.
  */
 
+import { createServer } from 'node:http';
 import express from 'express';
 import helmet from 'helmet';
 import compression from 'compression';
@@ -18,37 +20,58 @@ import cors from 'cors';
 import { config } from './config';
 import { healthRouter } from './routes/health';
 import { errorHandler } from './middleware/errorHandler';
+import { attachTunnelWs } from './tunnel/wsServer';
+import { tunnelProxy } from './tunnel/httpProxy';
+import { extractSubdomain } from './tunnel/host';
 
 function buildApp(): express.Express {
   const app = express();
 
   if (config.trustProxy) {
-    // Behind Cloudflare / nginx: trust the first proxy hop so req.ip becomes
-    // the real client IP for rate limiting.
     app.set('trust proxy', 1);
   }
 
-  app.use(helmet());
-  app.use(compression());
+  // Apex-only middleware. The relay is a byte forwarder for tunneled
+  // subdomain requests; setting CSP/HSTS/COOP, enforcing a CORS allow-list
+  // against the tunnel subdomain, or re-compressing iClaw's response are
+  // all the wrong layer to operate on content we never inspect.
+  //
+  // Net result: requests to `<sub>.<baseDomain>` skip helmet/cors/
+  // compression entirely and fall through to `tunnelProxy`. Requests to
+  // the apex (e.g. `/healthz`) keep full protection.
+  function apexOnly(mw: express.RequestHandler): express.RequestHandler {
+    return (req, res, next) => {
+      if (extractSubdomain(req.headers.host, config.baseDomain)) {
+        return next();
+      }
+      return mw(req, res, next);
+    };
+  }
 
+  app.use(apexOnly(helmet()));
+  app.use(apexOnly(compression()));
   app.use(
-    cors({
-      origin: (origin, cb) => {
-        const allow = config.cors.allowedOrigins;
-        if (allow === '*') return cb(null, true);
-        if (!origin) return cb(null, true);
-        if (allow.includes(origin)) return cb(null, true);
-        cb(new Error(`Origin ${origin} is not allowed by CORS`));
-      },
-      methods: ['GET', 'POST', 'OPTIONS'],
-      allowedHeaders: ['Content-Type'],
-      maxAge: 600,
-    }),
+    apexOnly(
+      cors({
+        origin: (origin, cb) => {
+          const allow = config.cors.allowedOrigins;
+          if (allow === '*') return cb(null, true);
+          if (!origin) return cb(null, true);
+          if (allow.includes(origin)) return cb(null, true);
+          cb(new Error(`Origin ${origin} is not allowed by CORS`));
+        },
+        methods: ['GET', 'POST', 'OPTIONS'],
+        allowedHeaders: ['Content-Type'],
+        maxAge: 600,
+      }),
+    ),
   );
 
-  app.use(express.json({ limit: '32kb' }));
-
   app.use(healthRouter);
+
+  // Tunnel proxy is the catch-all: it inspects the Host header, forwards to
+  // the matching tunnel, or calls `next()` to let normal apex routes run.
+  app.use(tunnelProxy);
 
   app.use(errorHandler);
   return app;
@@ -56,7 +79,10 @@ function buildApp(): express.Express {
 
 function main(): void {
   const app = buildApp();
-  const server = app.listen(config.port, config.host, () => {
+  const server = createServer(app);
+  attachTunnelWs(server);
+
+  server.listen(config.port, config.host, () => {
     console.log(
       `[iclaw-relay] listening on ${config.host}:${config.port} (${config.env}, base=${config.baseDomain})`,
     );
@@ -69,6 +95,21 @@ function main(): void {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // Last-resort safety net. The relay is a stateless byte-forwarder: every
+  // request/connection is independent, so a single unexpected throw must NOT
+  // be allowed to abort the whole process and take every live tunnel down
+  // with it. Without this, a malformed request that escapes a handler (e.g.
+  // inside the raw `server.on('upgrade')` path) combined with
+  // `systemd Restart=always` becomes a trivial remote crash-loop DoS. Log
+  // loudly and keep serving; if the failure is genuinely fatal the process
+  // will fall over on the next operation anyway.
+  process.on('uncaughtException', (err) => {
+    console.error(`[iclaw-relay] uncaughtException: ${err?.stack ?? err}`);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error(`[iclaw-relay] unhandledRejection: ${reason instanceof Error ? reason.stack : reason}`);
+  });
 }
 
 main();

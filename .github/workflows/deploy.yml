@@ -1,0 +1,115 @@
+name: Deploy to viralo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Don't allow overlapping deploys on the same environment.
+concurrency:
+  group: deploy-relay-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install + build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Pack release
+        id: pack
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          SHA=$(git rev-parse --short HEAD)
+          NAME="iclaw-relay-v${VERSION}-${SHA}"
+          tar -czf "${NAME}.tar.gz" dist package.json package-lock.json
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Packaged: $NAME.tar.gz ($(du -h "${NAME}.tar.gz" | cut -f1))"
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Trust host
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload + activate release
+        env:
+          REMOTE_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          REMOTE_HOST: ${{ secrets.DEPLOY_HOST }}
+          NAME: ${{ steps.pack.outputs.name }}
+        run: |
+          set -euo pipefail
+          REMOTE="$REMOTE_USER@$REMOTE_HOST"
+          scp "$NAME.tar.gz" "$REMOTE:/tmp/"
+          ssh "$REMOTE" "NAME='$NAME' bash -s" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          export PATH=/opt/node-v24/bin:/usr/bin:/bin
+          RELEASE_DIR="/opt/iclaw-relay/releases/$NAME"
+
+          # Idempotent: re-deploying the same SHA is a no-op-ish (clean slate).
+          rm -rf "$RELEASE_DIR"
+          mkdir -p "$RELEASE_DIR"
+          tar -xzf "/tmp/$NAME.tar.gz" -C "$RELEASE_DIR"
+          chown -R iclaw-relay:iclaw-relay "$RELEASE_DIR"
+
+          cd "$RELEASE_DIR"
+          sudo -u iclaw-relay env PATH=/opt/node-v24/bin:/usr/bin:/bin HOME=/tmp \
+            npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+
+          # Atomic flip
+          ln -sfn "$RELEASE_DIR" /opt/iclaw-relay/current
+          systemctl restart iclaw-relay
+
+          # Wait for the new process to come up and answer healthz.
+          for i in $(seq 1 10); do
+            sleep 1
+            if curl -sS -f --max-time 2 http://127.0.0.1:4100/healthz > /dev/null; then
+              echo "healthz ok after ${i}s"
+              break
+            fi
+          done
+          curl -sS -f --max-time 2 http://127.0.0.1:4100/healthz > /dev/null \
+            || { echo "ERROR: healthz failed after restart"; systemctl status iclaw-relay --no-pager; exit 1; }
+
+          # Keep the most recent 5 releases, prune older ones.
+          ls -1tr /opt/iclaw-relay/releases | head -n -5 | while read -r old; do
+            echo "pruning old release: $old"
+            rm -rf "/opt/iclaw-relay/releases/$old"
+          done
+
+          rm -f "/tmp/$NAME.tar.gz"
+          echo "deploy complete → $NAME"
+          REMOTE_SCRIPT
+
+      - name: Smoke test (public)
+        run: |
+          set -e
+          for i in $(seq 1 6); do
+            if curl -sS -f --max-time 5 https://relay.iclaw.digital/healthz > /dev/null; then
+              echo "✓ public healthz ok"
+              exit 0
+            fi
+            echo "  waiting for public healthz... ($i)"
+            sleep 2
+          done
+          echo "ERROR: public healthz failed"
+          exit 1

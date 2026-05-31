@@ -32,8 +32,37 @@ const RawConfigSchema = z.object({
   /**
    * Base domain under which per-tunnel subdomains are minted, e.g.
    * a tunnel "silver-fox" → https://silver-fox.iclaw.digital
+   *
+   * For local browser testing, set this to `lvh.me` (or `<ip>.nip.io`) —
+   * those wildcards resolve to 127.0.0.1 automatically, so the URL we
+   * print is openable directly in the browser without /etc/hosts.
    */
   BASE_DOMAIN: z.string().min(1).default('iclaw.digital'),
+
+  /**
+   * Scheme used when constructing the public tunnel URL we report back to
+   * the iClaw client. In production this is `https` (the relay sits
+   * behind a TLS terminator); in local dev set to `http` so the printed
+   * URL is openable in a browser without TLS.
+   */
+  PUBLIC_SCHEME: z.enum(['http', 'https']).default('https'),
+
+  /**
+   * Port to include in the public tunnel URL. Leave empty in production
+   * (so the URL uses the default 80/443). In local dev set to the same
+   * value as PORT (e.g. 4100) so browsers can reach the relay directly.
+   */
+  PUBLIC_PORT: z
+    .string()
+    .optional()
+    .transform((v) => {
+      if (v === undefined || v === '') return undefined;
+      const n = Number(v);
+      if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+        throw new Error(`PUBLIC_PORT must be 1..65535, got ${v}`);
+      }
+      return n;
+    }),
 
   /**
    * Comma-separated list of origins allowed for the public HTTP API.
@@ -48,6 +77,22 @@ const RawConfigSchema = z.object({
 
   /** Per-IP rate limit for first-access / invite validation (requests per minute). */
   RATE_LIMIT_INVITE_PER_IP_MINUTE: z.coerce.number().int().positive().default(60),
+
+  /**
+   * Anti-abuse caps on *new tunnel registrations* per source IP. Checked
+   * at WS upgrade time on /tunnel before we agree to assign a subdomain.
+   * Existing tunnels and the traffic flowing through them are NOT limited
+   * here — those are the legitimate volume.
+   *
+   * Defaults are kept loose enough to absorb reasonable reconnect
+   * behaviour from a real user with several active tunnels (each WS
+   * reconnect currently counts as a new registration). Tighten in prod
+   * if you see actual abuse.
+   *
+   * Loopback IPs (127.0.0.1 / ::1) are exempt entirely — see wsServer.ts.
+   */
+  TUNNEL_LIMIT_PER_HOUR: z.coerce.number().int().positive().default(20),
+  TUNNEL_LIMIT_PER_DAY: z.coerce.number().int().positive().default(60),
 
   /**
    * If true, log tunnel register/connect/disconnect events (subdomain,
@@ -66,6 +111,17 @@ const RawConfigSchema = z.object({
     .string()
     .transform((v) => v === 'true' || v === '1')
     .default('false'),
+
+  /**
+   * TEST-ONLY: append a JSONL record of everything the relay forwards
+   * (outer public request headers + the req/res frame bodies it sees) to
+   * this file. Used by the E2E integration test to prove the relay only
+   * ever handles ciphertext and to detect cookie/passphrase leakage.
+   *
+   * Refused unless NODE_ENV=test — this captures raw forwarded traffic and
+   * must never be enabled in production. Empty string disables it.
+   */
+  RELAY_CAPTURE_FILE: z.string().optional().default(''),
 });
 
 /* ---------------------------------------------------------------- parse -- */
@@ -95,6 +151,17 @@ function parseAllowedOrigins(input: string): readonly string[] | '*' {
   );
 }
 
+function buildPublicUrl(subdomain: string): string {
+  const scheme = raw.PUBLIC_SCHEME;
+  const port = raw.PUBLIC_PORT;
+  const base = raw.BASE_DOMAIN.replace(/\/+$/, '');
+  // Omit the port suffix when it matches the scheme's default.
+  const isDefaultPort =
+    (scheme === 'http' && port === 80) || (scheme === 'https' && port === 443);
+  const portSuffix = port === undefined || isDefaultPort ? '' : `:${port}`;
+  return `${scheme}://${subdomain}.${base}${portSuffix}`;
+}
+
 /** Strongly-typed config object exported to the rest of the app. */
 export const config = Object.freeze({
   env: raw.NODE_ENV,
@@ -103,6 +170,11 @@ export const config = Object.freeze({
   port: raw.PORT,
   host: raw.HOST,
   baseDomain: raw.BASE_DOMAIN.replace(/\/+$/, ''),
+  publicScheme: raw.PUBLIC_SCHEME,
+  publicPort: raw.PUBLIC_PORT,
+
+  /** Build the user-facing URL for a tunnel subdomain. */
+  publicUrlFor: buildPublicUrl,
 
   cors: Object.freeze({
     allowedOrigins: parseAllowedOrigins(raw.ALLOWED_ORIGINS),
@@ -111,10 +183,21 @@ export const config = Object.freeze({
   limits: Object.freeze({
     registerPerIpPerHour: raw.RATE_LIMIT_REGISTER_PER_IP_HOUR,
     invitePerIpPerMinute: raw.RATE_LIMIT_INVITE_PER_IP_MINUTE,
+    tunnelPerIpPerHour: raw.TUNNEL_LIMIT_PER_HOUR,
+    tunnelPerIpPerDay: raw.TUNNEL_LIMIT_PER_DAY,
   }),
 
   logAccess: raw.LOG_ACCESS,
   trustProxy: raw.TRUST_PROXY,
+
+  /**
+   * TEST-ONLY capture file (see RELAY_CAPTURE_FILE). Hard-gated to test mode:
+   * even if the env var is set, it is ignored outside NODE_ENV=test so it can
+   * never silently start logging raw traffic in production.
+   */
+  captureFile: raw.NODE_ENV === 'test' && raw.RELAY_CAPTURE_FILE.trim() !== ''
+    ? raw.RELAY_CAPTURE_FILE.trim()
+    : null,
 });
 
 /** Public type so callers can declare config-shaped params. */
