@@ -238,3 +238,16 @@ export function reassignTunnelToConn(
 export function tunnelCount(): number {
   return tunnelsBySubdomain.size;
 }
+
+/**
+ * Test-only: wipe the registry between tests so module-level singletons don't
+ * leak tunnels (and their unref'd evict timers) across cases. Mirrors
+ * `rateLimit.__resetForTests`.
+ */
+export function __resetRegistryForTests(): void {
+  for (const t of tunnelsBySubdomain.values()) {
+    if (t.evictTimer) clearTimeout(t.evictTimer);
+  }
+  tunnelsBySubdomain.clear();
+  tunnelsByTunnelId.clear();
+}

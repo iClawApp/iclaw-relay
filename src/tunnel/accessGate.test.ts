@@ -257,6 +257,40 @@ describe('evaluateTunnelAccessFromIncoming', () => {
     const decision = evaluateTunnelAccessFromIncoming(t, req);
     expect(decision.action).toBe('allow');
   });
+
+  // H2 regression: on the WS-upgrade path a thrown URIError escapes the raw
+  // server.on('upgrade') listener and crashes the whole process. A malformed
+  // percent-escape in the Cookie (or URL) must fail closed, never throw.
+  it('fails closed (no throw) on a malformed cookie percent-escape', () => {
+    const t = stubTunnel();
+    const req = {
+      url: '/ws',
+      headers: { cookie: `${ACCESS_COOKIE_NAME}=%` },
+    } as unknown as IncomingMessage;
+    let decision!: ReturnType<typeof evaluateTunnelAccessFromIncoming>;
+    expect(() => {
+      decision = evaluateTunnelAccessFromIncoming(t, req);
+    }).not.toThrow();
+    expect(decision.action).toBe('forbidden');
+  });
+
+  it('fails closed (no throw) on a malformed request URL', () => {
+    const t = stubTunnel();
+    const req = { url: '/%E0%A4%A', headers: {} } as unknown as IncomingMessage;
+    expect(() => evaluateTunnelAccessFromIncoming(t, req)).not.toThrow();
+  });
+
+  it('still honours a valid token when an unrelated cookie is malformed', () => {
+    // A broken cookie must not block a legitimate ?access= token: parseCookies
+    // recovers per-cookie rather than discarding the whole header.
+    const t = stubTunnel();
+    const req = {
+      url: `/ws?${ACCESS_QUERY_PARAM}=${FIXTURE_TOKEN}`,
+      headers: { cookie: `junk=%ZZ; other=ok` },
+    } as unknown as IncomingMessage;
+    const decision = evaluateTunnelAccessFromIncoming(t, req);
+    expect(decision.action).toBe('allow');
+  });
 });
 
 describe('applyHttpAccessGate', () => {
@@ -347,6 +381,25 @@ describe('applyHttpAccessGate', () => {
     const res = mockRes();
     expect(applyHttpAccessGate(tunnel, req, res)).toBe(true);
     expect(res.redirect).not.toHaveBeenCalled();
+  });
+
+  // H2 regression on the HTTP path: malformed cookie → fail closed with a 403,
+  // never bubble a 500 out of the handler.
+  it('fails closed with 403 (no throw) on a malformed cookie', () => {
+    const tunnel = stubTunnel();
+    const req = {
+      path: '/',
+      originalUrl: '/',
+      headers: { cookie: `${ACCESS_COOKIE_NAME}=%E0%A4%A` },
+      protocol: 'https',
+    } as unknown as Request;
+    const res = mockRes();
+    let result!: boolean;
+    expect(() => {
+      result = applyHttpAccessGate(tunnel, req, res);
+    }).not.toThrow();
+    expect(result).toBe(false);
+    expect(res.statusCode).toBe(403);
   });
 });
 
