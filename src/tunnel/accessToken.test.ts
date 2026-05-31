@@ -6,11 +6,15 @@ import {
   ACCESS_COOKIE_NAME,
   buildAccessCookieHeader,
   hashAccessToken,
+  hashOwnerSecret,
   isValidAccessTokenFormat,
+  isValidOwnerProofFormat,
   isValidTokenHashFormat,
   mintAccessSessionValue,
+  ownershipClaimAccepted,
   verifyAccessSession,
   verifyAccessToken,
+  verifyOwnerSecret,
 } from './accessToken';
 
 /** Stable 32-byte token for deterministic assertions. */
@@ -57,5 +61,46 @@ describe('accessToken', () => {
 
     const secure = buildAccessCookieHeader(session, true);
     expect(secure).toContain('Secure');
+  });
+});
+
+describe('tunnel ownership proof (H1)', () => {
+  const proof = randomBytes(32).toString('base64url');
+  const proofHash = createHash('sha256').update(proof, 'utf8').digest('base64url');
+
+  it('hashes a proof the same way the client does', () => {
+    expect(hashOwnerSecret(proof)).toBe(proofHash);
+  });
+
+  it('verifies a matching proof and rejects a wrong one', () => {
+    expect(verifyOwnerSecret(proof, proofHash)).toBe(true);
+    const wrong = randomBytes(32).toString('base64url');
+    expect(verifyOwnerSecret(wrong, proofHash)).toBe(false);
+  });
+
+  it('validates proof format (base64url, 43–128 chars)', () => {
+    expect(isValidOwnerProofFormat(proof)).toBe(true);
+    expect(isValidOwnerProofFormat('short')).toBe(false);
+    expect(isValidOwnerProofFormat('has+slash/and=pad')).toBe(false);
+  });
+
+  describe('ownershipClaimAccepted', () => {
+    it('accepts any claim on a legacy tunnel with no owner hash', () => {
+      expect(ownershipClaimAccepted(null, null)).toBe(true);
+      expect(ownershipClaimAccepted(null, proof)).toBe(true);
+    });
+
+    it('requires a matching proof once an owner hash is set', () => {
+      expect(ownershipClaimAccepted(proofHash, proof)).toBe(true);
+    });
+
+    it('rejects a missing proof against an owned tunnel', () => {
+      expect(ownershipClaimAccepted(proofHash, null)).toBe(false);
+    });
+
+    it('rejects a wrong proof against an owned tunnel', () => {
+      const wrong = randomBytes(32).toString('base64url');
+      expect(ownershipClaimAccepted(proofHash, wrong)).toBe(false);
+    });
   });
 });

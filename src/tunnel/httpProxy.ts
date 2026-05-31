@@ -40,6 +40,14 @@ const REQUEST_TIMEOUT_MS = 30_000;
  */
 const MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
 
+/**
+ * Upper bound on in-flight HTTP requests awaiting a `res` frame per tunnel.
+ * Each entry holds a 30s timer + promise; without a cap a client past the
+ * gate could pile up requests faster than iClaw answers them. 256 is well
+ * above real concurrency.
+ */
+const MAX_PENDING_PER_TUNNEL = 256;
+
 class PayloadTooLargeError extends Error {
   constructor() {
     super('request body too large');
@@ -83,6 +91,12 @@ export const tunnelProxy: RequestHandler = (req, res, next) => {
   }
 
   if (!applyHttpAccessGate(tunnel, req, res)) {
+    return;
+  }
+
+  if (tunnel.pending.size >= MAX_PENDING_PER_TUNNEL) {
+    res.status(503).setHeader('Retry-After', '1');
+    res.type('text/plain').send('tunnel busy');
     return;
   }
 

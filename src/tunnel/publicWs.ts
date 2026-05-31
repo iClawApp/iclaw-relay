@@ -29,6 +29,14 @@ const publicWss = new WebSocketServer({
   handleProtocols: () => false,
 });
 
+/**
+ * Upper bound on concurrent public WS streams multiplexed onto a single
+ * tunnel. A client past the access gate could otherwise open unbounded
+ * sockets, each pinned in `tunnel.streams` and bridged to the shared iClaw
+ * control WS. 256 is far above any real browser's needs.
+ */
+const MAX_STREAMS_PER_TUNNEL = 256;
+
 function safeSend(ws: WebSocket, payload: string): void {
   if (ws.readyState !== WebSocket.OPEN) return;
   try {
@@ -48,6 +56,16 @@ export function bridgePublicUpgrade(
   // can't forward this WS upgrade. Refuse at the HTTP layer so the
   // browser sees a clean 503 rather than a black-hole socket.
   if (tunnel.reconnecting || !tunnel.conn || tunnel.conn.ws.readyState !== WebSocket.OPEN) {
+    socket.write(
+      'HTTP/1.1 503 Service Unavailable\r\n' +
+      'Retry-After: 5\r\n' +
+      'Connection: close\r\n' +
+      'Content-Length: 0\r\n\r\n',
+    );
+    socket.destroy();
+    return;
+  }
+  if (tunnel.streams.size >= MAX_STREAMS_PER_TUNNEL) {
     socket.write(
       'HTTP/1.1 503 Service Unavailable\r\n' +
       'Retry-After: 5\r\n' +

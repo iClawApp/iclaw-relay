@@ -71,6 +71,26 @@ export function verifyOwnerSecret(proof: string, storedHash: string): boolean {
 }
 
 /**
+ * The single authorization decision behind H1 (subdomain-hijack defence):
+ * may a re-registering connection claim an existing tunnel?
+ *
+ *  - `ownerHash === null` → legacy tunnel registered before ownership proofs
+ *    existed; accept and let the caller adopt the presented proof.
+ *  - otherwise a syntactically valid proof matching the stored hash is
+ *    REQUIRED. Missing or wrong proof → reject.
+ *
+ * Pure on purpose so the security-critical rule is exhaustively unit-tested.
+ */
+export function ownershipClaimAccepted(
+  ownerHash: string | null,
+  ownerProof: string | null,
+): boolean {
+  if (ownerHash === null) return true;
+  if (!ownerProof) return false;
+  return verifyOwnerSecret(ownerProof, ownerHash);
+}
+
+/**
  * Upper bound on concurrent access sessions per tunnel. Generous enough for a
  * person's devices/tabs while capping memory if a link is shared widely. When
  * exceeded, the oldest session is evicted (insertion order).

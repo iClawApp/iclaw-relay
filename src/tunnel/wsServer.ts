@@ -50,7 +50,7 @@ import { checkAndCountTunnelRegistration } from './rateLimit';
 import {
   isValidTokenHashFormat,
   isValidOwnerProofFormat,
-  verifyOwnerSecret,
+  ownershipClaimAccepted,
   hashOwnerSecret,
 } from './accessToken';
 import {
@@ -62,6 +62,53 @@ import {
 const KEEP_ALIVE_MS = 30_000;
 
 const TUNNEL_PATH = '/tunnel';
+
+/**
+ * Resource caps on the unauthenticated /tunnel endpoint. Any iClaw may open
+ * one (that's the point), so without a ceiling an attacker can hold sockets
+ * open until the relay runs out of file descriptors / keep-alive timers and
+ * legitimate hosts can no longer connect. Bound both the global count and the
+ * per-IP count; loopback (local-mode dev) is exempt from the per-IP cap only.
+ */
+export const MAX_TUNNEL_CONNS = 2048;
+export const MAX_TUNNEL_CONNS_PER_IP = 64;
+
+let totalTunnelConns = 0;
+const tunnelConnsPerIp = new Map<string, number>();
+
+/** Pure cap decision, exported for unit tests. */
+export function wouldExceedConnCap(opts: {
+  total: number;
+  perIp: number;
+  isLoopback: boolean;
+}): boolean {
+  if (opts.total >= MAX_TUNNEL_CONNS) return true;
+  if (!opts.isLoopback && opts.perIp >= MAX_TUNNEL_CONNS_PER_IP) return true;
+  return false;
+}
+
+function overCapacity(ip: string): boolean {
+  return wouldExceedConnCap({
+    total: totalTunnelConns,
+    perIp: tunnelConnsPerIp.get(ip) ?? 0,
+    isLoopback: isLoopbackIp(ip),
+  });
+}
+
+function acquireConn(ip: string): void {
+  totalTunnelConns += 1;
+  if (!isLoopbackIp(ip)) {
+    tunnelConnsPerIp.set(ip, (tunnelConnsPerIp.get(ip) ?? 0) + 1);
+  }
+}
+
+function releaseConn(ip: string): void {
+  totalTunnelConns = Math.max(0, totalTunnelConns - 1);
+  if (isLoopbackIp(ip)) return;
+  const cur = tunnelConnsPerIp.get(ip) ?? 0;
+  if (cur <= 1) tunnelConnsPerIp.delete(ip);
+  else tunnelConnsPerIp.set(ip, cur - 1);
+}
 
 function firstHeader(v: string | string[] | undefined): string | undefined {
   const raw = Array.isArray(v) ? v[0] : v;
@@ -136,6 +183,19 @@ export function attachTunnelWs(server: HttpServer): void {
     // (1) Outbound iClaw client opening its shared WS.
     if (url.pathname === TUNNEL_PATH) {
       const ip = getClientIp(req);
+      if (overCapacity(ip)) {
+        if (config.logAccess) {
+          console.warn(`[tunnel] connection refused (capacity) ip=${ip}`);
+        }
+        socket.write(
+          'HTTP/1.1 503 Service Unavailable\r\n' +
+          'Retry-After: 30\r\n' +
+          'Connection: close\r\n' +
+          'Content-Length: 0\r\n\r\n',
+        );
+        socket.destroy();
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => handleIclawConnection(ws, ip));
       return;
     }
@@ -164,6 +224,7 @@ export function attachTunnelWs(server: HttpServer): void {
 
 function handleIclawConnection(ws: WebSocket, ip: string): void {
   const conn = newConnection(ws, ip);
+  acquireConn(ip);
   if (config.logAccess) {
     console.log(`[tunnel] conn open ip=${ip}`);
   }
@@ -196,6 +257,7 @@ function handleIclawConnection(ws: WebSocket, ip: string): void {
     routeFromIclaw(conn, frame, raw);
   });
 
+  let released = false;
   const cleanup = (): void => {
     if (conn.pingTimer) {
       clearInterval(conn.pingTimer);
@@ -204,6 +266,11 @@ function handleIclawConnection(ws: WebSocket, ip: string): void {
     // Sticky subdomains: keep tunnelId → subdomain reservations alive for
     // the grace window so iClaw's reconnect lands on the same URL.
     detachConnAndKeepReserved(conn);
+    // 'error' then 'close' both reach cleanup — release the capacity slot once.
+    if (!released) {
+      released = true;
+      releaseConn(ip);
+    }
     if (config.logAccess) {
       console.log(`[tunnel] conn close ip=${ip}`);
     }
@@ -315,20 +382,18 @@ function handleRegister(conn: IclawConnection, frame: RegisterTunnelFrame): void
   // carries an owner hash.
   const claimable = getTunnelByTunnelIdGlobal(tunnelId);
   if (claimable && claimable.conn !== conn) {
-    if (claimable.ownerHash) {
-      if (!ownerProof || !verifyOwnerSecret(ownerProof, claimable.ownerHash)) {
-        // Throttle tunnelId brute-force like a fresh registration, then refuse
-        // WITHOUT mutating the tunnel — the real owner keeps its subdomain.
-        if (!isLoopbackIp(conn.ip)) {
-          checkAndCountTunnelRegistration(conn.ip, {
-            perHour: config.limits.tunnelPerIpPerHour,
-            perDay: config.limits.tunnelPerIpPerDay,
-          });
-        }
-        console.warn(`[tunnel] restore denied (ownership mismatch) ip=${conn.ip}`);
-        sendRejected(conn, tunnelId, 'ownership proof required');
-        return;
+    if (!ownershipClaimAccepted(claimable.ownerHash, ownerProof)) {
+      // Throttle tunnelId brute-force like a fresh registration, then refuse
+      // WITHOUT mutating the tunnel — the real owner keeps its subdomain.
+      if (!isLoopbackIp(conn.ip)) {
+        checkAndCountTunnelRegistration(conn.ip, {
+          perHour: config.limits.tunnelPerIpPerHour,
+          perDay: config.limits.tunnelPerIpPerDay,
+        });
       }
+      console.warn(`[tunnel] restore denied (ownership mismatch) ip=${conn.ip}`);
+      sendRejected(conn, tunnelId, 'ownership proof required');
+      return;
     }
     const restored = reassignTunnelToConn(tunnelId, conn);
     if (restored) {
